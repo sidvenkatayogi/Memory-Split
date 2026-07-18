@@ -1,5 +1,12 @@
 # FarmShare runbook — memory-split battery
 
+Status 2026-07-18 00:30: repo synced to scratch (pre-corpus-package state —
+resync first), venv built (torch 2.13.0+cu130), tiktoken cache warmed. The
+2026-07-17 bring-up session ended with ALL outbound port-22 traffic blocked
+by the local network (github.com:22 and FarmShare both time out; ping fine)
+— restore an SSH-capable network (e.g. Stanford VPN), then do the human
+step below.
+
 One human step is required whenever the SSH control socket has expired
 (FarmShare is password + Duo only):
 
@@ -86,3 +93,6 @@ protected last; the <= $300 RunPod burst is its contingency.
   driver 595.71.05 / CUDA 13.2).
 - train_single.sbatch requeues and `--resume auto` continues from ckpt.pt
   (checkpoint every 30 min), so the 2-day wall is safe for all presets.
+- FineWeb-Edu streaming must be anonymous (`token=False`, already in
+  scripts/build_corpus.py): a stale ambient HF token turns public-repo
+  requests into 401s. Do not export HF_TOKEN in the data-prep job.

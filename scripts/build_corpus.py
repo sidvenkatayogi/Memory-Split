@@ -27,8 +27,11 @@ STAGE_TOKENS = {"gates": 800_000_000, "full": 3_200_000_000}
 def bed_iter_hf():
     from datasets import load_dataset
 
+    # token=False: fineweb-edu is public; a stale ambient HF token would
+    # otherwise turn every request into a 401.
     ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True
+        "HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train",
+        streaming=True, token=False,
     )
     for row in ds:
         yield row["text"]
