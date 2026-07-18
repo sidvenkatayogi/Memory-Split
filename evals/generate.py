@@ -97,7 +97,17 @@ def generate_batch_with_stats(
         return [], stats
 
     prompt_ids = [tok.encode(p) for p in prompts]
+    # Clamp to the model's context: leave room for generation, and truncate
+    # over-long prompts from the LEFT (keep the question end).
+    ctx = getattr(getattr(model, "cfg", None), "ctx", None)
+    if ctx is not None:
+        keep = max(8, ctx - min(max_new, ctx // 2))
+        if any(len(p) > keep for p in prompt_ids):
+            logger.warning("left-truncating %d prompt(s) to %d tokens",
+                           sum(len(p) > keep for p in prompt_ids), keep)
+            prompt_ids = [p[-keep:] for p in prompt_ids]
     pad_to = max(1, max(len(p) for p in prompt_ids))
+    steps_budget = max_new if ctx is None else min(max_new, ctx - pad_to)
     # Left-pad with EOT so logits[:, -1, :] is the next-token distribution for
     # every row after a single prefill. With RoPE (relative positions) a
     # constant left shift is harmless for greedy decoding at these scales;
@@ -108,7 +118,7 @@ def generate_batch_with_stats(
     seqs = [_Seq() for _ in prompts]
     with torch.no_grad():
         logits, cache = model.forward_step(x, None)
-        for _ in range(max_new):
+        for _ in range(steps_budget):
             choices = logits[:, -1, :].argmax(dim=-1).tolist()
             next_ids: list[int] = []
             for b, s in enumerate(seqs):
