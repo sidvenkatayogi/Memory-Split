@@ -98,8 +98,10 @@ def _greedy_ids(model, tok, ctx_ids: list[int], n_steps: int, device) -> list[in
 def _load_dataset(cache_dir, *args, **kwargs):
     from datasets import load_dataset  # lazy: offline unit tests never import it
 
+    # token=False: every suite dataset is public; a stale ambient HF token
+    # would otherwise 401 (same pitfall as FineWeb-Edu in build_corpus).
     try:
-        return load_dataset(*args, cache_dir=cache_dir, **kwargs)
+        return load_dataset(*args, cache_dir=cache_dir, token=False, **kwargs)
     except Exception as e:  # noqa: BLE001 - surface any loader failure clearly
         raise RuntimeError(
             f"could not load HF dataset {args}: the natural suite needs network "
@@ -155,17 +157,21 @@ def run_natural_suite(
     """
     results: dict[str, dict] = {}
     for task in tasks:
+        # namespaced repo ids: datasets>=5 rejects bare canonical names
         if task == "hellaswag":
-            ds = _load_dataset(cache_dir, "hellaswag", split="validation")
+            ds = _load_dataset(cache_dir, "Rowan/hellaswag", split="validation")
             results[task] = _choice_metrics(model, tok, device, _iter_hellaswag(ds), limit)
         elif task == "arc_easy":
-            ds = _load_dataset(cache_dir, "ai2_arc", "ARC-Easy", split="validation")
+            ds = _load_dataset(cache_dir, "allenai/ai2_arc", "ARC-Easy", split="validation")
             results[task] = _choice_metrics(model, tok, device, _iter_arc_easy(ds), limit)
         elif task == "piqa":
-            ds = _load_dataset(cache_dir, "piqa", split="validation")
+            # ybisk/piqa main branch is a script dataset (unsupported in
+            # datasets>=5); the auto-converted parquet branch loads cleanly.
+            ds = _load_dataset(cache_dir, "ybisk/piqa", split="validation",
+                               revision="refs/convert/parquet")
             results[task] = _choice_metrics(model, tok, device, _iter_piqa(ds), limit)
         elif task == "winogrande":
-            ds = _load_dataset(cache_dir, "winogrande", "winogrande_xl", split="validation")
+            ds = _load_dataset(cache_dir, "allenai/winogrande", "winogrande_xl", split="validation")
             results[task] = _choice_metrics(model, tok, device, _iter_winogrande(ds), limit)
         elif task == "lambada":
             # lambada_openai ships a test split only (standard for this eval)
