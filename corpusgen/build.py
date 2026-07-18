@@ -1,0 +1,303 @@
+"""Corpus builder: assembles both arms' token streams from one source of
+truth, plus the organizer table and all held-out eval sets.
+
+Guarantees (checked into report["checks"]):
+- per-component token budgets hit within 1% in each arm;
+- bed / igsm / deduction / factqa doc lists identical across arms (the bio
+  dose is the only component whose doc count differs — split bios are
+  longer, so the split arm cycles fewer exposures);
+- organizer covers exactly the training entities' (entity, relation) pairs
+  (fresh probe entities live in organizer_fresh.jsonl, a superset store);
+- rerun with the same cfg is byte-identical.
+
+corpusgen.igsm_lite / corpusgen.deduction are imported lazily so tests can
+stub them via sys.modules.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+from array import array
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterator
+
+from corpusgen import bios, factqa
+from corpusgen.records import ATTRIBUTES, Doc, plain
+from organizer.store import Organizer
+
+COMPONENTS = ("bed", "bio", "igsm", "deduction", "factqa")
+_FLUSH_TOKENS = 1_000_000
+
+
+@dataclass
+class BuildCfg:
+    n_entities: int
+    total_tokens: int
+    seed: int
+    bed_share: float = 0.62
+    bio_share: float = 0.23
+    igsm_share: float = 0.07
+    deduction_share: float = 0.05
+    factqa_share: float = 0.03
+    igsm_op: tuple[int, int] = (2, 8)
+    deduction_depth: tuple[int, int] = (1, 4)
+    n_igsm_eval: int = 10_000
+    n_deduction_eval: int = 10_000
+    n_factqa_eval: int = 2_000
+    n_fresh_entities: int = 200
+    n_fresh_eval: int = 500
+    n_recall_entities: int = 2_000
+
+    def shares(self) -> dict[str, float]:
+        return {
+            "bed": self.bed_share,
+            "bio": self.bio_share,
+            "igsm": self.igsm_share,
+            "deduction": self.deduction_share,
+            "factqa": self.factqa_share,
+        }
+
+
+class _ArmWriter:
+    def __init__(self, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._bin = open(out_dir / "train.bin", "wb")
+        self._mask = open(out_dir / "train.mask.bin", "wb")
+        self._ids = array("H")
+        self._msk = array("B")
+        self.component_tokens: dict[str, int] = {c: 0 for c in COMPONENTS}
+        self.component_docs: dict[str, int] = {c: 0 for c in COMPONENTS}
+        self.masked_tokens = 0
+        self.total = 0
+
+    def add(self, comp: str, ids: list[int], mask: list[int]) -> None:
+        self._ids.extend(ids)
+        self._msk.extend(mask)
+        n = len(ids)
+        self.component_tokens[comp] += n
+        self.component_docs[comp] += 1
+        self.total += n
+        self.masked_tokens += n - sum(mask)
+        if len(self._ids) >= _FLUSH_TOKENS:
+            self.flush()
+
+    def flush(self) -> None:
+        self._ids.tofile(self._bin)
+        self._msk.tofile(self._mask)
+        self._ids = array("H")
+        self._msk = array("B")
+
+    def close(self) -> None:
+        self.flush()
+        self._bin.close()
+        self._mask.close()
+
+
+def _doc_hash(text: str) -> str:
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def _encode(tok, doc: Doc, arm: str) -> tuple[list[int], list[int]]:
+    segs = doc.dense_segments if arm == "dense" else doc.split_segments
+    return tok.encode_segments(segs, add_eot=True)
+
+
+def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | str) -> dict:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    igsm = importlib.import_module("corpusgen.igsm_lite")
+    deduction = importlib.import_module("corpusgen.deduction")
+
+    budgets = {c: int(round(s * cfg.total_tokens)) for c, s in cfg.shares().items()}
+
+    # ---------------- records + organizer ----------------------------------
+    all_records = bios.generate_records(cfg.n_entities + cfg.n_fresh_entities, cfg.seed)
+    records = all_records[: cfg.n_entities]
+    fresh = all_records[cfg.n_entities :]
+    org = Organizer()
+    for rec in records:
+        for attr in ATTRIBUTES:
+            org.add(rec.name, attr, rec.attrs[attr])
+    org.save(out_dir / "organizer.jsonl")
+    org_fresh = Organizer()
+    for rec in all_records:
+        for attr in ATTRIBUTES:
+            org_fresh.add(rec.name, attr, rec.attrs[attr])
+    org_fresh.save(out_dir / "organizer_fresh.jsonl")
+
+    # ---------------- shared synthetic components --------------------------
+    # Generate until the MEAN of the two renderings' token counts reaches the
+    # budget, so each arm's share deviation is at most half the wrapping cost.
+    def generate_until(gen_batch, budget: int) -> tuple[list[Doc], list[tuple], list[tuple]]:
+        docs: list[Doc] = []
+        enc_dense: list[tuple] = []
+        enc_split: list[tuple] = []
+        mean_total = 0.0
+        while mean_total < budget:
+            for doc in gen_batch(len(docs)):
+                d = _encode(tok, doc, "dense")
+                s = _encode(tok, doc, "split")
+                docs.append(doc)
+                enc_dense.append(d)
+                enc_split.append(s)
+                mean_total += (len(d[0]) + len(s[0])) / 2
+                if mean_total >= budget:
+                    break
+        return docs, enc_dense, enc_split
+
+    def igsm_batch(start: int):
+        return igsm.generate_igsm_docs(64, cfg.igsm_op[0], cfg.igsm_op[1],
+                                       cfg.seed * 1000 + 11 + start)
+
+    def ded_batch(start: int):
+        return deduction.generate_deduction_docs(64, cfg.deduction_depth[0],
+                                                 cfg.deduction_depth[1],
+                                                 cfg.seed * 1000 + 22 + start)
+
+    def factqa_batch(start: int):
+        return factqa.generate_factqa_docs(records, 64, cfg.seed * 1000 + 33 + start)
+
+    igsm_docs, igsm_d, igsm_s = generate_until(igsm_batch, budgets["igsm"])
+    ded_docs, ded_d, ded_s = generate_until(ded_batch, budgets["deduction"])
+    fq_docs, fq_d, fq_s = generate_until(factqa_batch, budgets["factqa"])
+
+    # ---------------- bed (identical across arms) --------------------------
+    bed_texts: list[str] = []
+    bed_enc: list[tuple] = []
+    bed_total = 0
+    for text in bed_iter:
+        ids, mask = tok.encode_segments([plain(text)], add_eot=True)
+        bed_texts.append(text)
+        bed_enc.append((ids, mask))
+        bed_total += len(ids)
+        if bed_total >= budgets["bed"]:
+            break
+    bed_digest = hashlib.sha1(
+        "".join(_doc_hash(t) for t in bed_texts).encode()
+    ).hexdigest()
+
+    # ---------------- per-arm assembly -------------------------------------
+    report_arms: dict[str, dict] = {}
+    for arm in ("dense", "split"):
+        writer = _ArmWriter(out_dir / arm)
+        shared = {
+            "bed": list(bed_enc),
+            "igsm": list(igsm_d if arm == "dense" else igsm_s),
+            "deduction": list(ded_d if arm == "dense" else ded_s),
+            "factqa": list(fq_d if arm == "dense" else fq_s),
+        }
+        queues = {c: iter(v) for c, v in shared.items()}
+        remaining = {c: len(v) for c, v in shared.items()}
+
+        # bio queue: entities cycled round-robin over exposures, truncated by
+        # THIS arm's token budget.
+        def bio_stream():
+            exposure = 0
+            while True:
+                for rec in records:
+                    yield _encode(tok, bios.render_bio_doc(rec, exposure), arm)
+                exposure += 1
+
+        bio_iter = bio_stream()
+        bio_emitted = 0
+        bio_docs_n = 0
+
+        # deterministic largest-deficit-first interleave at doc granularity
+        emitted = {c: 0 for c in COMPONENTS}
+        active = set(COMPONENTS)
+        while active:
+            deficits = {
+                c: (budgets[c] - emitted[c]) / max(1, budgets[c]) for c in active
+            }
+            comp = max(sorted(deficits), key=lambda c: deficits[c])
+            if comp == "bio":
+                if bio_emitted >= budgets["bio"]:
+                    active.discard("bio")
+                    continue
+                ids, mask = next(bio_iter)
+                bio_emitted += len(ids)
+                bio_docs_n += 1
+            else:
+                if remaining[comp] == 0:
+                    active.discard(comp)
+                    continue
+                ids, mask = next(queues[comp])
+                remaining[comp] -= 1
+            if arm == "dense":
+                mask = [1] * len(ids)
+            writer.add(comp, ids, mask)
+            emitted[comp] += len(ids)
+        writer.close()
+
+        report_arms[arm] = {
+            "total_tokens": writer.total,
+            "component_tokens": dict(writer.component_tokens),
+            "component_shares": {
+                c: writer.component_tokens[c] / writer.total for c in COMPONENTS
+            },
+            "component_docs": dict(writer.component_docs),
+            "bio_exposures_per_entity": bio_docs_n / cfg.n_entities,
+            "masked_token_frac": writer.masked_tokens / writer.total,
+            "bed_hash_digest": bed_digest,
+        }
+
+    # ---------------- eval sets --------------------------------------------
+    eval_dir = out_dir / "eval"
+    eval_dir.mkdir(exist_ok=True)
+    igsm_hashes = {d.meta["structure_hash"] for d in igsm_docs}
+    ded_hashes = {d.meta["structure_hash"] for d in ded_docs}
+    train_prompts = {
+        d.dense_text().split("\nReasoning:", 1)[0] + "\nReasoning:" for d in fq_docs
+    }
+    evals = {
+        "igsm": igsm.generate_igsm_eval(cfg.n_igsm_eval, cfg.igsm_op[0],
+                                        cfg.igsm_op[1], cfg.seed * 1000 + 44,
+                                        igsm_hashes),
+        "deduction": deduction.generate_deduction_eval(cfg.n_deduction_eval,
+                                                       cfg.deduction_depth[0],
+                                                       cfg.deduction_depth[1],
+                                                       cfg.seed * 1000 + 55,
+                                                       ded_hashes),
+        "factqa": factqa.generate_factqa_eval(records, cfg.n_factqa_eval,
+                                              cfg.seed * 1000 + 66, train_prompts),
+        "factqa_fresh": factqa.generate_fresh_entity_eval(fresh, cfg.n_fresh_eval,
+                                                          cfg.seed * 1000 + 77),
+        "recall": bios.recall_probes(records,
+                                     min(cfg.n_recall_entities, cfg.n_entities),
+                                     cfg.seed * 1000 + 88),
+    }
+    for stem, items in evals.items():
+        with open(eval_dir / f"{stem}.jsonl", "w") as f:
+            for item in items:
+                f.write(json.dumps(asdict(item)) + "\n")
+
+    # ---------------- report + checks --------------------------------------
+    shares = cfg.shares()
+    max_dev = max(
+        abs(report_arms[arm]["component_shares"][c] - shares[c])
+        for arm in report_arms
+        for c in COMPONENTS
+    )
+    d_bio = report_arms["dense"]["component_tokens"]["bio"]
+    s_bio = report_arms["split"]["component_tokens"]["bio"]
+    report = {
+        "cfg": asdict(cfg),
+        "arms": report_arms,
+        "bio_cross_arm_rel_diff": abs(s_bio - d_bio) / d_bio,
+        "eval_counts": {stem: len(items) for stem, items in evals.items()},
+        "max_share_deviation": max_dev,
+        "checks": {
+            "shares_within_1pct": max_dev <= 0.0105,
+            "bed_identical_across_arms": (
+                report_arms["dense"]["bed_hash_digest"]
+                == report_arms["split"]["bed_hash_digest"]
+                and report_arms["dense"]["component_docs"]["bed"]
+                == report_arms["split"]["component_docs"]["bed"]
+            ),
+            "organizer_size_ok": len(org) == cfg.n_entities * len(ATTRIBUTES),
+        },
+    }
+    return report

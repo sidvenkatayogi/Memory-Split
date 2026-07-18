@@ -77,6 +77,8 @@ def main() -> None:
     tok = get_tok()
     model = load_model(run_dir, args.ckpt, device)
     organizer = Organizer.load(data_dir / "organizer.jsonl")
+    fresh_path = data_dir / "organizer_fresh.jsonl"
+    organizer_fresh = Organizer.load(fresh_path) if fresh_path.exists() else organizer
 
     out = run_dir / "evals"
     out.mkdir(exist_ok=True)
@@ -96,8 +98,9 @@ def main() -> None:
         if not path.exists():
             continue
         items = cap(load_items(path))
+        store = organizer_fresh if task == "factqa_fresh" else organizer
         rows, stats = score_items(
-            model, tok, items, organizer if use_store else None, device,
+            model, tok, items, store if use_store else None, device,
             batch_size=args.batch_size,
         )
         save_results(rows, out / f"{task}.jsonl")
