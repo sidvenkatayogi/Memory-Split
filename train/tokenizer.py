@@ -10,6 +10,16 @@ exactly onto token boundaries (no BPE merges across a mask edge).
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+# Pin the BPE file cache inside the repo (committed) so training jobs and
+# sandboxed processes never need network for tokenizer setup.
+_CACHE_DIR = Path(__file__).resolve().parent.parent / ".tiktoken_cache"
+if "TIKTOKEN_CACHE_DIR" not in os.environ:
+    _CACHE_DIR.mkdir(exist_ok=True)
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(_CACHE_DIR)
+
 import tiktoken
 
 from corpusgen.records import Segment
