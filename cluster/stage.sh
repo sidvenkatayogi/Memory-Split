@@ -62,7 +62,9 @@ echo "== 4/5 gate training runs (chained afterok:$GATES_DATA_JID)"
     --stage gates --data-root $DATA"
 while IFS= read -r cfg; do
     [ -z "$cfg" ] && continue
-    jid=$("${SSH[@]}" "cd $REPO && sbatch --parsable \
+    # -n: keep the inner ssh from consuming the loop's stdin
+    jid=$(ssh -n -o ControlPath="$SOCK" -o BatchMode=yes "$SUNET_ID@$LOGIN_HOST" \
+        "cd $REPO && sbatch --parsable \
         --dependency=afterok:$GATES_DATA_JID \
         --export=ALL,CONFIG='$cfg' cluster/slurm/train_single.sbatch")
     echo "  gate run $cfg: job $jid"
