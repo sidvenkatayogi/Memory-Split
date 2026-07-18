@@ -96,6 +96,18 @@ from the 160M sweep; 3. drop the 1B confirmation to 1 seed-pair and
 restore the second pair on the <= $300 RunPod burst (keep whole pairs on
 one platform). The 1B top-load paired contrast is protected last.
 
+## Operational gotchas (learned 2026-07-18 staging)
+
+- **wheat-01 is a bad node**: jobs placed there die in ~4 s with exit
+  `0:53` and no output file (three data builds in a row). Add
+  `--exclude=wheat-01` if it recurs; healthy wheat/barley nodes work.
+- **Always `cd` into $FS_REPO_DIR before sbatch**: the templates resolve
+  `cluster/config.env` and write logs via `$SLURM_SUBMIT_DIR`.
+- stage.sh submits the gate training runs with `afterok:<gates-data-job>`;
+  if the data job is requeued/resubmitted, resubmit the gate runs against
+  the new job id (afterok on a FAILED job leaves them pending forever —
+  cancel with `scancel` and resubmit).
+
 ## Known facts (recon 2026-07-12/13 + this bring-up)
 
 - QOS gpu: 4 concurrent GPU jobs, 32 submitted max, MaxWall 2 days,
