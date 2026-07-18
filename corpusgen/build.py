@@ -19,10 +19,11 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-from array import array
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
+
+import numpy as np
 
 from corpusgen import bios, factqa
 from corpusgen.records import ATTRIBUTES, Doc, plain
@@ -70,33 +71,49 @@ class BuildCfg:
 
 
 class _ArmWriter:
+    """Streams uint16 token ids + uint8 loss masks to disk with bounded RAM.
+
+    mask=None means "all loss ON" (dense renderings, bed, knowledge-free
+    docs) and is materialized only at flush time, so the big shared bed
+    encoding never carries a mask array in memory.
+    """
+
     def __init__(self, out_dir: Path):
         out_dir.mkdir(parents=True, exist_ok=True)
         self._bin = open(out_dir / "train.bin", "wb")
         self._mask = open(out_dir / "train.mask.bin", "wb")
-        self._ids = array("H")
-        self._msk = array("B")
+        self._id_bufs: list[np.ndarray] = []
+        self._mask_bufs: list[np.ndarray | int] = []  # int n == ones(n)
+        self._buffered = 0
         self.component_tokens: dict[str, int] = {c: 0 for c in COMPONENTS}
         self.component_docs: dict[str, int] = {c: 0 for c in COMPONENTS}
         self.masked_tokens = 0
         self.total = 0
 
-    def add(self, comp: str, ids: list[int], mask: list[int]) -> None:
-        self._ids.extend(ids)
-        self._msk.extend(mask)
+    def add(self, comp: str, ids: np.ndarray, mask: np.ndarray | None) -> None:
         n = len(ids)
+        self._id_bufs.append(ids)
+        self._mask_bufs.append(mask if mask is not None else n)
+        self._buffered += n
         self.component_tokens[comp] += n
         self.component_docs[comp] += 1
         self.total += n
-        self.masked_tokens += n - sum(mask)
-        if len(self._ids) >= _FLUSH_TOKENS:
+        if mask is not None:
+            self.masked_tokens += n - int(mask.sum())
+        if self._buffered >= _FLUSH_TOKENS:
             self.flush()
 
     def flush(self) -> None:
-        self._ids.tofile(self._bin)
-        self._msk.tofile(self._mask)
-        self._ids = array("H")
-        self._msk = array("B")
+        if not self._id_bufs:
+            return
+        np.concatenate(self._id_bufs).tofile(self._bin)
+        np.concatenate(
+            [m if isinstance(m, np.ndarray) else np.ones(m, dtype=np.uint8)
+             for m in self._mask_bufs]
+        ).tofile(self._mask)
+        self._id_bufs = []
+        self._mask_bufs = []
+        self._buffered = 0
 
     def close(self) -> None:
         self.flush()
@@ -108,9 +125,14 @@ def _doc_hash(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()
 
 
-def _encode(tok, doc: Doc, arm: str) -> tuple[list[int], list[int]]:
+def _encode(tok, doc: Doc, arm: str) -> tuple[np.ndarray, np.ndarray | None]:
+    """Encode one doc for one arm; mask is None when every token gets loss."""
     segs = doc.dense_segments if arm == "dense" else doc.split_segments
-    return tok.encode_segments(segs, add_eot=True)
+    ids, mask = tok.encode_segments(segs, add_eot=True)
+    ids_arr = np.asarray(ids, dtype=np.uint16)
+    if 0 in mask:
+        return ids_arr, np.asarray(mask, dtype=np.uint8)
+    return ids_arr, None
 
 
 def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | str) -> dict:
@@ -172,27 +194,25 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
     ded_docs, ded_d, ded_s = generate_until(ded_batch, budgets["deduction"])
     fq_docs, fq_d, fq_s = generate_until(factqa_batch, budgets["factqa"])
 
-    # ---------------- bed (identical across arms) --------------------------
-    bed_texts: list[str] = []
-    bed_enc: list[tuple] = []
+    # ---------------- bed (identical across arms; ids only, mask implicit) --
+    bed_hasher = hashlib.sha1()
+    bed_enc: list[np.ndarray] = []
     bed_total = 0
     for text in bed_iter:
-        ids, mask = tok.encode_segments([plain(text)], add_eot=True)
-        bed_texts.append(text)
-        bed_enc.append((ids, mask))
+        ids, _ = tok.encode_segments([plain(text)], add_eot=True)
+        bed_hasher.update(_doc_hash(text).encode())
+        bed_enc.append(np.asarray(ids, dtype=np.uint16))
         bed_total += len(ids)
         if bed_total >= budgets["bed"]:
             break
-    bed_digest = hashlib.sha1(
-        "".join(_doc_hash(t) for t in bed_texts).encode()
-    ).hexdigest()
+    bed_digest = bed_hasher.hexdigest()
 
     # ---------------- per-arm assembly -------------------------------------
     report_arms: dict[str, dict] = {}
     for arm in ("dense", "split"):
         writer = _ArmWriter(out_dir / arm)
         shared = {
-            "bed": list(bed_enc),
+            "bed": [(ids, None) for ids in bed_enc],
             "igsm": list(igsm_d if arm == "dense" else igsm_s),
             "deduction": list(ded_d if arm == "dense" else ded_s),
             "factqa": list(fq_d if arm == "dense" else fq_s),
@@ -235,7 +255,7 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
                 ids, mask = next(queues[comp])
                 remaining[comp] -= 1
             if arm == "dense":
-                mask = [1] * len(ids)
+                mask = None  # dense arm: loss everywhere, by construction
             writer.add(comp, ids, mask)
             emitted[comp] += len(ids)
         writer.close()

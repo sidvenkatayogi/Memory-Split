@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/config.env"
 require_sunet
 HOST="${1:-$LOGIN_HOST}"
 SRC=$(expand_path "$FS_REPO_DIR")
-SOCK="$HOME/.ssh/cm-%r@%h:%p"
+SOCK=$(cm_socket)
 mkdir -p "$REPO_DIR/outputs/cluster"
 rsync -az \
     --include '*/' \
