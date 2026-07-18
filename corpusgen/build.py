@@ -31,6 +31,14 @@ from organizer.store import Organizer
 COMPONENTS = ("bed", "bio", "igsm", "deduction", "factqa")
 _FLUSH_TOKENS = 1_000_000
 
+# canonical fact-load levels (entities); single source of truth for scripts
+LOADS: dict[str, int] = {
+    "n50k": 50_000,
+    "n200k": 200_000,
+    "n800k": 800_000,
+    "n4m": 4_000_000,  # 1B-scale dose: ~212 Mbit demanded at low exposures
+}
+
 
 @dataclass
 class BuildCfg:

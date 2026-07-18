@@ -2,8 +2,12 @@
 """Build per-load corpora (both arms) + organizer + eval sets.
 
 Usage:
-  python scripts/build_corpus.py --out-root DATA_ROOT --stage gates|full \
+  python scripts/build_corpus.py --out-root DATA_ROOT --stage gates|full|full1b \
       [--loads n50k,n200k,n800k] [--bed-file local_text.txt] [--total-tokens N]
+
+Stages: gates = 0.8B tokens (160M pilots), full = 3.2B (160M sweep),
+full1b = 10B tokens for the 1B confirmation — defaults to loads n800k,n4m
+and writes into {load}_1b/ directories (larger bed, same generators).
 
 Bed text: FineWeb-Edu sample-10BT streamed via HF datasets (deterministic
 shard order), or --bed-file (one doc per paragraph split on blank lines)
@@ -17,11 +21,16 @@ import itertools
 import json
 from pathlib import Path
 
-from corpusgen.build import BuildCfg, build_corpus
+from corpusgen.build import LOADS, BuildCfg, build_corpus
 from train.tokenizer import get_tok
 
-LOADS = {"n50k": 50_000, "n200k": 200_000, "n800k": 800_000}
-STAGE_TOKENS = {"gates": 800_000_000, "full": 3_200_000_000}
+STAGE_TOKENS = {"gates": 800_000_000, "full": 3_200_000_000, "full1b": 10_000_000_000}
+STAGE_DEFAULT_LOADS = {
+    "gates": "n50k,n200k,n800k",
+    "full": "n50k,n200k,n800k",
+    "full1b": "n800k,n4m",
+}
+STAGE_DIR_TAG = {"gates": "", "full": "", "full1b": "_1b"}
 
 
 def bed_iter_hf():
@@ -48,7 +57,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-root", required=True)
     ap.add_argument("--stage", default="full", choices=list(STAGE_TOKENS))
-    ap.add_argument("--loads", default="n50k,n200k,n800k")
+    ap.add_argument("--loads", default=None)
     ap.add_argument("--bed-file", default=None)
     ap.add_argument("--total-tokens", type=int, default=None)
     ap.add_argument("--seed", type=int, default=1234)
@@ -56,8 +65,10 @@ def main() -> None:
 
     tok = get_tok()
     total = args.total_tokens or STAGE_TOKENS[args.stage]
-    for load in args.loads.split(","):
-        out_dir = Path(args.out_root) / load
+    loads = args.loads or STAGE_DEFAULT_LOADS[args.stage]
+    tag = STAGE_DIR_TAG[args.stage]
+    for load in loads.split(","):
+        out_dir = Path(args.out_root) / (load + tag)
         out_dir.mkdir(parents=True, exist_ok=True)
         cfg = BuildCfg(
             n_entities=LOADS[load],

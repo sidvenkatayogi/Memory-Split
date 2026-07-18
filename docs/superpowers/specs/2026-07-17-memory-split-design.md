@@ -108,9 +108,14 @@ past the dense arm's recall saturation.
 
 | Stage | Scale | Tokens | Runs | Est. per-run |
 |---|---|---|---|---|
-| Dose sweep | 160M | 3.2B | 3 loads x 2 arms x 2 seeds = 12 | ~10-15 L40S-h |
-| Confirmation | 410M | 8B | top load x 2 arms x 3 seeds = 6 | ~45 L40S-h |
-| Stretch | 1B | 10B | top load x 2 arms x 1 seed = 2 | ~135 L40S-h (requeue chain or 4-GPU) |
+| Dose sweep | 160M | 3.2B | 3 loads x 2 arms x 2 seeds = 12 | ~8-15 L40S-h |
+| Confirmation | 1B | 10B | top load x 2 arms x 2 seeds = 4 | ~130-160 L40S-h (dependency-chained across the 2-day MaxWall) |
+| Optional add-back | 410M | 8B | top load x 2 arms x 3 seeds = 6 | ~40-60 L40S-h |
+
+(Amended 2026-07-18, user decision "option B": the confirmation tier moves
+from 410M x 3 seeds to 1B x 2 seeds so the headline contrast is at the
+mission's billion-parameter scale; the 410M tier becomes an optional
+scaling point if the calendar allows. Total compute is roughly unchanged.)
 
 ### 3.4 Endpoint and decision rule
 
@@ -120,17 +125,19 @@ past the dense arm's recall saturation.
   accuracy (split scored with organizer; dense closed-book) is co-reported
   as the "system-level" reasoning-over-knowledge secondary — it conflates
   store access, so it does not carry H1 alone.
-- **H1 tests:** (a) confirmation contrast at 410M top load: split - dense on
-  the primary composite, 3 seeds, per-item paired bootstrap clustered by
-  problem template; (b) sweep interaction: difference in slope of composite
-  vs log N between arms at 160M.
+- **H1 tests:** (a) confirmation contrast at 1B top load: split - dense on
+  the primary composite, 2 seed-pairs, per-item paired bootstrap clustered
+  by problem template; (b) sweep interaction: difference in slope of
+  composite vs log N between arms at 160M.
 - **Decision rule (structure fixed now; exact margins pinned at freeze from
   pilot seed-sigma):** positive iff confirmation delta > max(2 x pooled
-  seed-sigma, 0.5 pt) with the same sign in all 3 seed pairs AND H2 holds
+  seed-sigma, 0.5 pt) with the same sign in both seed pairs AND H2 holds
   (split-with-store recall >= dense closed-book - 2 pts). Defensible null
   iff the 95% CI of the confirmation delta lies within (-margin, +margin)
   and gates A-C passed. Anything else: report as underpowered/inconclusive
-  with the failure mode named.
+  with the failure mode named. With only 2 seed-pairs at 1B, seed sigma is
+  estimated pooled across the 160M sweep pairs (preregistered), and the
+  per-item clustered CI carries the precision claim.
 - Natural benchmarks (HellaSwag, ARC-E, PIQA, LAMBADA, WinoGrande — cloze,
   CORRECT-PROB continuous scoring and accuracy) and bits-per-byte on
   held-out slices (bed slice, bio slice, reasoning slice) are supporting
@@ -271,16 +278,17 @@ gpu partition, QOS gpu: 4 concurrent GPU jobs, 32 submitted, MaxWall
   rule constants committed to git
   (docs/superpowers/specs/2026-07-22-preregistration.md) before any
   confirmation run starts.
-- **Days 5-9 — sweep + confirmation.** 12 sweep runs then 6 confirmation
-  runs, 4 concurrent; evals stream as checkpoints land.
-- **Days 9-12 — stretch.** 1B pair only if sweep+confirmation are done and
-  analyzed.
+- **Days 5-7 — sweep.** 12 sweep runs, 4 concurrent; evals stream as
+  checkpoints land; gate-B top load confirmed from sweep dense arms.
+- **Days 6-12 — 1B confirmation.** 4 chained runs (2 arms x 2 seeds) via
+  cluster/submit_chain.sh, filling all 4 GPU slots as sweep runs drain.
 - **Days 12-14 — report.** Analysis, dose-response figure, month-end
-  report.
-- **Kill order under schedule pressure:** drop 1B stretch; drop one fact
-  level; drop confirmation to 2 seeds. The 410M top-load multi-seed
-  contrast is protected last; the <= $300 RunPod burst is the contingency
-  for exactly that contrast.
+  report. 410M add-back tier only if everything above is done early.
+- **Kill order under schedule pressure:** drop the 410M add-back (default
+  off); drop one fact level from the sweep; drop the 1B confirmation to
+  1 seed-pair and restore the second pair on the <= $300 RunPod burst
+  (whole pairs stay on one platform). The 1B top-load paired contrast is
+  protected last.
 
 Compute worst case ~730 L40S-hours vs ~1,300 nominally available at 4
 concurrent GPUs over the window.
@@ -293,8 +301,9 @@ concurrent GPUs over the window.
   memorization pressure, equal by construction).
 - Crowding may not bind at 160M/410M with feasible N (gate B may trigger
   its "no crowding" branch — that is a reportable result, not a failure).
-- 1B stretch is single-seed: labeled as anecdote, never pooled with the
-  confirmation statistics.
+- 1B confirmation runs at 10 tokens/param (below compute-optimal) and with
+  2 seed-pairs; the sweep provides the multi-seed replication and the
+  pooled seed-sigma estimate.
 - iGSM-lite is a reimplementation, not the released iGSM; distributional
   drift risk is bounded by gate A.
 - FarmShare is queue-shared and free; wall-clock risk handled by

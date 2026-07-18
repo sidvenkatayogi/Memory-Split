@@ -1,8 +1,15 @@
 #!/usr/bin/env python
 """Generate run configs + a manifest TSV for a battery stage.
 
+Stages (schedule option B, decided 2026-07-18):
+  gates   - 160M short-budget pilots for gates A-C
+  sweep   - 160M dose-response: 3 loads x 2 arms x 2 seeds
+  confirm - 1B confirmation: top load x 2 arms x 2 seeds (submit each
+            config via cluster/submit_chain.sh — runs outlast the 2-day wall)
+  mid410  - OPTIONAL 410M tier (2 arms x 3 seeds), add-back if calendar allows
+
 Usage:
-  python scripts/make_manifest.py --stage gates|sweep|confirm|stretch \
+  python scripts/make_manifest.py --stage gates|sweep|confirm|mid410 \
       --data-root /scratch/users/syz/memorysplit_data [--top-load n800k]
 
 Writes configs/gen/{stage}_{arm}_{load}_s{seed}.yaml and
@@ -16,7 +23,9 @@ from pathlib import Path
 
 import yaml
 
-LOADS = {"n50k": 50_000, "n200k": 200_000, "n800k": 800_000}
+from corpusgen.build import LOADS
+
+SWEEP_LOADS = ("n50k", "n200k", "n800k")
 
 SCALE = {
     # preset: (total_tokens, tokens/step, micro_bs, lr, warmup)
@@ -28,12 +37,13 @@ SCALE = {
 GATE_TOKENS = 800_000_000  # short-budget pilots for gates A-C
 
 
-def make_cfg(preset, arm, load, seed, data_root, out_root, total_tokens=None):
+def make_cfg(preset, arm, load, seed, data_root, out_root, total_tokens=None,
+             data_tag=""):
     tokens, tps, mbs, lr, warmup = SCALE[preset]
     if total_tokens is not None:
         tokens = total_tokens
     run_id = f"{preset}_{arm}_{load}_s{seed}" + ("" if total_tokens is None else "_gate")
-    data_dir = Path(data_root) / load
+    data_dir = Path(data_root) / (load + data_tag)
     return run_id, {
         "run_id": run_id,
         "model": preset,
@@ -62,7 +72,8 @@ def make_cfg(preset, arm, load, seed, data_root, out_root, total_tokens=None):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", required=True, choices=["gates", "sweep", "confirm", "stretch"])
+    ap.add_argument("--stage", required=True,
+                    choices=["gates", "sweep", "calib1b", "confirm", "mid410"])
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--out-root", default="outputs")
     ap.add_argument("--top-load", default="n800k", choices=list(LOADS))
@@ -70,21 +81,29 @@ def main() -> None:
 
     jobs: list[tuple[str, dict]] = []
     if args.stage == "gates":
-        for load in LOADS:  # gate A+B: dense across loads
+        for load in SWEEP_LOADS:  # gate A+B: dense across loads
             jobs.append(make_cfg("d160m", "dense", load, 0, args.data_root, args.out_root, GATE_TOKENS))
         jobs.append(make_cfg("d160m", "split", "n200k", 0, args.data_root, args.out_root, GATE_TOKENS))
     elif args.stage == "sweep":
-        for load in LOADS:
+        for load in SWEEP_LOADS:
             for arm in ("dense", "split"):
                 for seed in (0, 1):
                     jobs.append(make_cfg("d160m", arm, load, seed, args.data_root, args.out_root))
+    elif args.stage == "calib1b":
+        # gate B at scale: short dense 1B runs on the two candidate doses
+        # (1.5B tokens ~ 20 L40S-h each) to pick the load that binds at 1B
+        for load in ("n800k", "n4m"):
+            jobs.append(make_cfg("d1b", "dense", load, 0, args.data_root,
+                                 args.out_root, 1_500_000_000, data_tag="_1b"))
     elif args.stage == "confirm":
+        for arm in ("dense", "split"):
+            for seed in (0, 1):
+                jobs.append(make_cfg("d1b", arm, args.top_load, seed,
+                                     args.data_root, args.out_root, data_tag="_1b"))
+    elif args.stage == "mid410":
         for arm in ("dense", "split"):
             for seed in (0, 1, 2):
                 jobs.append(make_cfg("d410m", arm, args.top_load, seed, args.data_root, args.out_root))
-    elif args.stage == "stretch":
-        for arm in ("dense", "split"):
-            jobs.append(make_cfg("d1b", arm, args.top_load, 0, args.data_root, args.out_root))
 
     gen_dir = Path("configs/gen")
     gen_dir.mkdir(parents=True, exist_ok=True)

@@ -54,19 +54,31 @@ Then write and commit `docs/superpowers/specs/2026-07-22-preregistration.md`
 (margins = max(2 x pooled pilot seed-sigma, 0.5 pt); freeze before any
 confirmation run).
 
-## Days 3-9 — battery
+## Days 3-12 — battery (schedule option B, 2026-07-18: 1B confirmation)
 
 ```bash
-# full-budget corpora (3.2B dense tokens per load; several hours, CPU node)
+# full-budget corpora: 160M sweep (3.2B tokens/load) AND the 1B corpora
+# (10B tokens at loads n800k_1b + n4m_1b) — CPU node, several hours each
 sbatch --export=ALL,BUILD_ARGS="--stage full" cluster/slurm/data_prep.sbatch
-# 12 sweep runs (~10-15 L40S-h each), 4 run concurrently (QOS cap)
+sbatch --export=ALL,BUILD_ARGS="--stage full1b" cluster/slurm/data_prep.sbatch
+
+# 12 sweep runs (~8-15 L40S-h each), 4 concurrent (QOS cap)
 python scripts/make_manifest.py --stage sweep --data-root ...
 bash cluster/submit_manifest.sh outputs/manifests/sweep.tsv
-# then 6 confirmation runs at the gate-B top load
-python scripts/make_manifest.py --stage confirm --top-load nXXXk --data-root ...
-bash cluster/submit_manifest.sh outputs/manifests/confirm.tsv
-# stretch pair only if sweep+confirm are analyzed and the calendar allows
-python scripts/make_manifest.py --stage stretch --top-load nXXXk --data-root ...
+
+# gate B at scale: two short dense-1B calibration runs (~20 h each) pick
+# the dose that binds at 1B (n800k vs n4m; 1B has ~6x the 160M capacity)
+python scripts/make_manifest.py --stage calib1b --data-root ...
+bash cluster/submit_manifest.sh outputs/manifests/calib1b.tsv
+
+# 1B confirmation: 2 arms x 2 seeds, ~130-160 h per run -> submit each as
+# a dependency chain (Slurm does not requeue TIMEOUT; each link resumes
+# from ckpt.pt automatically)
+python scripts/make_manifest.py --stage confirm --top-load <calib winner> --data-root ...
+while read cfg; do bash cluster/submit_chain.sh "$cfg" 4; done < outputs/manifests/confirm.tsv
+
+# OPTIONAL 410M tier, only if the calendar allows after the 1B runs land
+python scripts/make_manifest.py --stage mid410 --top-load <winner> --data-root ...
 ```
 
 Evals per finished run: `scripts/run_evals.py --run outputs/<run_id>`
@@ -79,9 +91,10 @@ bash cluster/sync_pull.sh
 
 ## Kill order (schedule pressure)
 
-1. drop the 1B stretch; 2. drop one fact level from the sweep;
-3. confirmation 3 seeds -> 2. The 410M top-load multi-seed contrast is
-protected last; the <= $300 RunPod burst is its contingency.
+1. drop the optional 410M add-back (default off); 2. drop one fact level
+from the 160M sweep; 3. drop the 1B confirmation to 1 seed-pair and
+restore the second pair on the <= $300 RunPod burst (keep whole pairs on
+one platform). The 1B top-load paired contrast is protected last.
 
 ## Known facts (recon 2026-07-12/13 + this bring-up)
 
