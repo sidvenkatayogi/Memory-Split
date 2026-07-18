@@ -30,7 +30,9 @@ STAGE_DEFAULT_LOADS = {
     "full": "n50k,n200k,n800k",
     "full1b": "n800k,n4m",
 }
-STAGE_DIR_TAG = {"gates": "", "full": "", "full1b": "_1b"}
+# each stage owns its directories — gates and full builds may run
+# concurrently and must never share output paths (learned the hard way)
+STAGE_DIR_TAG = {"gates": "_gate", "full": "", "full1b": "_1b"}
 
 
 def bed_iter_hf():

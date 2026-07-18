@@ -82,8 +82,10 @@ def main() -> None:
     jobs: list[tuple[str, dict]] = []
     if args.stage == "gates":
         for load in SWEEP_LOADS:  # gate A+B: dense across loads
-            jobs.append(make_cfg("d160m", "dense", load, 0, args.data_root, args.out_root, GATE_TOKENS))
-        jobs.append(make_cfg("d160m", "split", "n200k", 0, args.data_root, args.out_root, GATE_TOKENS))
+            jobs.append(make_cfg("d160m", "dense", load, 0, args.data_root,
+                                 args.out_root, GATE_TOKENS, data_tag="_gate"))
+        jobs.append(make_cfg("d160m", "split", "n200k", 0, args.data_root,
+                             args.out_root, GATE_TOKENS, data_tag="_gate"))
     elif args.stage == "sweep":
         for load in SWEEP_LOADS:
             for arm in ("dense", "split"):
