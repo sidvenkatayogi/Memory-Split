@@ -23,4 +23,4 @@ VENV=$(expand_path "$FS_VENV")
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$SLURM_SUBMIT_DIR"
 echo "node=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader) config=$CONFIG"
-exec "$VENV/bin/python" scripts/train.py --config "$CONFIG" --resume auto
+exec "$VENV/bin/python" scripts/run_train.py --config "$CONFIG" --resume auto

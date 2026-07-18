@@ -61,9 +61,12 @@ class PackedShards:
         if msk is not None:
             m = msk.reshape(self.batch_size, self.ctx + 1)[:, 1:]
             y[torch.from_numpy((m == 0).copy())] = -100
-        if self.device != "cpu":
+        if self.device == "cuda":
             x = x.pin_memory().to(self.device, non_blocking=True)
             y = y.pin_memory().to(self.device, non_blocking=True)
+        elif self.device != "cpu":
+            x = x.to(self.device)
+            y = y.to(self.device)
         return x, y
 
     def masked_value_batch(self, max_batches: int = 8) -> tuple[torch.Tensor, torch.Tensor] | None:

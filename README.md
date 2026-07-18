@@ -24,7 +24,7 @@ evals/        generative scorers with lookup interception, recall probes,
               bits-in-weights accounting, natural benchmarks, paired stats,
               dose-response figure
 configs/      YAML per run: {scale} x {arm} x {load} x {seed}
-scripts/      build_corpus.py, train.py, run_evals.py, analyze.py, smoke_test.py
+scripts/      build_corpus.py, run_train.py, run_evals.py, analyze.py, smoke_test.py
 cluster/      FarmShare (Slurm) scaffolding: sync, env, sbatch templates
 tests/        pytest suite; `python -m pytest` runs offline in <1 min
 ```

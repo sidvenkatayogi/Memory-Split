@@ -62,13 +62,13 @@ def train_arm(arm: str, data_dir: Path, out_dir: Path, device: str, steps: int) 
     cfg = {
         "run_id": f"smoke_{arm}",
         "arm": arm,
-        "model": {"n_layer": 4, "n_head": 4, "d_model": 256, "ctx": 256, "vocab_size": 50304},
+        "model": {"n_layer": 4, "n_head": 4, "d_model": 256, "ctx": 512, "vocab_size": 50304},
         "train_bin": str(data_dir / arm / "train.bin"),
         "train_mask": str(data_dir / arm / "train.mask.bin"),
         "data_dir": str(data_dir),
         "n_entities": 40,
-        "micro_batch_size": 8,
-        "tokens_per_step": 8 * 256,
+        "micro_batch_size": 4,
+        "tokens_per_step": 4 * 512,
         "max_steps": steps,
         "lr": 1.5e-3,
         "warmup_steps": 20,
@@ -103,7 +103,9 @@ def main() -> None:
         import itertools
 
         cfg = BuildCfg(n_entities=40, total_tokens=240_000, seed=7,
+                       igsm_op=(2, 4), deduction_depth=(1, 3),
                        n_igsm_eval=60, n_deduction_eval=60, n_factqa_eval=40,
+                       n_fresh_entities=20, n_fresh_eval=20,
                        n_recall_entities=30)
         report = build_corpus(cfg, tok, itertools.cycle(toy_bed()), SMOKE_DIR)
         print("corpus report:", json.dumps({k: v for k, v in report.items()
