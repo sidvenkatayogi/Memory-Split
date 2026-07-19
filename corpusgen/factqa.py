@@ -117,16 +117,23 @@ def _draw(kind: str, records: list[BioRecord], rng: random.Random,
             return a, b, None
 
 
-def _birth_city_index(records: list[BioRecord]) -> dict[str, list[BioRecord]]:
+def birth_city_index(records: list[BioRecord]) -> dict[str, list[BioRecord]]:
+    """Precompute once and pass to the generators below when calling them
+    repeatedly: rebuilding it per call is O(len(records)) and was the
+    quadratic blowup that timed out the 4M-entity corpus builds."""
     index: dict[str, list[BioRecord]] = {}
     for rec in records:
         index.setdefault(rec.attrs["birth_city"], []).append(rec)
     return index
 
 
-def generate_factqa_docs(records: list[BioRecord], n_docs: int, seed: int) -> list[Doc]:
+_birth_city_index = birth_city_index  # backward-compat alias
+
+
+def generate_factqa_docs(records: list[BioRecord], n_docs: int, seed: int,
+                         index: dict[str, list[BioRecord]] | None = None) -> list[Doc]:
     rng = random.Random(seed)
-    index = _birth_city_index(records)
+    index = index if index is not None else birth_city_index(records)
     kinds, weights = zip(*KIND_WEIGHTS)
     docs: list[Doc] = []
     for _ in range(n_docs):
@@ -158,9 +165,10 @@ def generate_factqa_docs(records: list[BioRecord], n_docs: int, seed: int) -> li
 
 def _eval_items(records: list[BioRecord], n_items: int, seed: int,
                 train_prompts: set[str] | None, kinds_weights, qid_prefix: str,
-                extra_meta: dict | None = None) -> list[QAItem]:
+                extra_meta: dict | None = None,
+                index: dict[str, list[BioRecord]] | None = None) -> list[QAItem]:
     rng = random.Random(seed)
-    index = _birth_city_index(records)
+    index = index if index is not None else birth_city_index(records)
     kinds, weights = zip(*kinds_weights)
     items: list[QAItem] = []
     seen_prompts: set[str] = set(train_prompts or set())
@@ -198,8 +206,10 @@ def _eval_items(records: list[BioRecord], n_items: int, seed: int,
 
 
 def generate_factqa_eval(records: list[BioRecord], n_items: int, seed: int,
-                         train_prompts: set[str] | None = None) -> list[QAItem]:
-    return _eval_items(records, n_items, seed, train_prompts, KIND_WEIGHTS, "factqa")
+                         train_prompts: set[str] | None = None,
+                         index: dict[str, list[BioRecord]] | None = None) -> list[QAItem]:
+    return _eval_items(records, n_items, seed, train_prompts, KIND_WEIGHTS,
+                       "factqa", index=index)
 
 
 def generate_fresh_entity_eval(fresh_records: list[BioRecord], n_items: int,

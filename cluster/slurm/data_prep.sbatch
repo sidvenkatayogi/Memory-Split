@@ -21,5 +21,7 @@ DATA=$(expand_path "$FS_DATA")
 mkdir -p "$DATA"
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$SLURM_SUBMIT_DIR"
-export HF_HOME="$DATA/hf_cache"
-exec "$VENV/bin/python" scripts/build_corpus.py --out-root "$DATA" ${BUILD_ARGS:-}
+# per-job HF cache: concurrent builds sharing one cache dir contend on
+# datasets' file locks
+export HF_HOME="$DATA/hf_cache_$SLURM_JOB_ID"
+exec "$VENV/bin/python" -u scripts/build_corpus.py --out-root "$DATA" ${BUILD_ARGS:-}

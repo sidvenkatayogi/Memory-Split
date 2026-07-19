@@ -19,11 +19,20 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+
+
+def _log(msg: str) -> None:
+    print(f"[build +{time.monotonic() - _T0:8.1f}s] {msg}", flush=True)
+
+
+_T0 = time.monotonic()
 
 from corpusgen import bios, factqa
 from corpusgen.records import ATTRIBUTES, Doc, plain
@@ -144,9 +153,11 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
     budgets = {c: int(round(s * cfg.total_tokens)) for c, s in cfg.shares().items()}
 
     # ---------------- records + organizer ----------------------------------
+    _log(f"start: n_entities={cfg.n_entities} total_tokens={cfg.total_tokens}")
     all_records = bios.generate_records(cfg.n_entities + cfg.n_fresh_entities, cfg.seed)
     records = all_records[: cfg.n_entities]
     fresh = all_records[cfg.n_entities :]
+    _log(f"records generated: {len(all_records)}")
     org = Organizer()
     for rec in records:
         for attr in ATTRIBUTES:
@@ -157,15 +168,17 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
         for attr in ATTRIBUTES:
             org_fresh.add(rec.name, attr, rec.attrs[attr])
     org_fresh.save(out_dir / "organizer_fresh.jsonl")
+    _log("organizers saved")
 
     # ---------------- shared synthetic components --------------------------
     # Generate until the MEAN of the two renderings' token counts reaches the
     # budget, so each arm's share deviation is at most half the wrapping cost.
-    def generate_until(gen_batch, budget: int) -> tuple[list[Doc], list[tuple], list[tuple]]:
+    def generate_until(gen_batch, budget: int, label: str) -> tuple[list[Doc], list[tuple], list[tuple]]:
         docs: list[Doc] = []
         enc_dense: list[tuple] = []
         enc_split: list[tuple] = []
         mean_total = 0.0
+        next_log = budget / 8
         while mean_total < budget:
             for doc in gen_batch(len(docs)):
                 d = _encode(tok, doc, "dense")
@@ -174,8 +187,12 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
                 enc_dense.append(d)
                 enc_split.append(s)
                 mean_total += (len(d[0]) + len(s[0])) / 2
+                if mean_total >= next_log:
+                    _log(f"{label}: {mean_total/1e6:.0f}M/{budget/1e6:.0f}M tokens, {len(docs)} docs")
+                    next_log += budget / 8
                 if mean_total >= budget:
                     break
+        _log(f"{label}: done ({len(docs)} docs)")
         return docs, enc_dense, enc_split
 
     def igsm_batch(start: int):
@@ -187,29 +204,38 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
                                                  cfg.deduction_depth[1],
                                                  cfg.seed * 1000 + 22 + start)
 
-    def factqa_batch(start: int):
-        return factqa.generate_factqa_docs(records, 64, cfg.seed * 1000 + 33 + start)
+    fq_index = factqa.birth_city_index(records)  # once, not per 64-doc batch
 
-    igsm_docs, igsm_d, igsm_s = generate_until(igsm_batch, budgets["igsm"])
-    ded_docs, ded_d, ded_s = generate_until(ded_batch, budgets["deduction"])
-    fq_docs, fq_d, fq_s = generate_until(factqa_batch, budgets["factqa"])
+    def factqa_batch(start: int):
+        return factqa.generate_factqa_docs(records, 64, cfg.seed * 1000 + 33 + start,
+                                           index=fq_index)
+
+    igsm_docs, igsm_d, igsm_s = generate_until(igsm_batch, budgets["igsm"], "igsm")
+    ded_docs, ded_d, ded_s = generate_until(ded_batch, budgets["deduction"], "deduction")
+    fq_docs, fq_d, fq_s = generate_until(factqa_batch, budgets["factqa"], "factqa")
 
     # ---------------- bed (identical across arms; ids only, mask implicit) --
     bed_hasher = hashlib.sha1()
     bed_enc: list[np.ndarray] = []
     bed_total = 0
+    next_log = budgets["bed"] / 16
     for text in bed_iter:
         ids, _ = tok.encode_segments([plain(text)], add_eot=True)
         bed_hasher.update(_doc_hash(text).encode())
         bed_enc.append(np.asarray(ids, dtype=np.uint16))
         bed_total += len(ids)
+        if bed_total >= next_log:
+            _log(f"bed: {bed_total/1e6:.0f}M/{budgets['bed']/1e6:.0f}M tokens, {len(bed_enc)} docs")
+            next_log += budgets["bed"] / 16
         if bed_total >= budgets["bed"]:
             break
     bed_digest = bed_hasher.hexdigest()
+    _log(f"bed: done ({len(bed_enc)} docs)")
 
     # ---------------- per-arm assembly -------------------------------------
     report_arms: dict[str, dict] = {}
     for arm in ("dense", "split"):
+        next_arm_log = cfg.total_tokens / 8
         writer = _ArmWriter(out_dir / arm)
         shared = {
             "bed": [(ids, None) for ids in bed_enc],
@@ -258,7 +284,11 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
                 mask = None  # dense arm: loss everywhere, by construction
             writer.add(comp, ids, mask)
             emitted[comp] += len(ids)
+            if writer.total >= next_arm_log:
+                _log(f"{arm} arm: {writer.total/1e6:.0f}M tokens written")
+                next_arm_log += cfg.total_tokens / 8
         writer.close()
+        _log(f"{arm} arm: done ({writer.total/1e6:.0f}M tokens)")
 
         report_arms[arm] = {
             "total_tokens": writer.total,
@@ -290,17 +320,20 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
                                                        cfg.seed * 1000 + 55,
                                                        ded_hashes),
         "factqa": factqa.generate_factqa_eval(records, cfg.n_factqa_eval,
-                                              cfg.seed * 1000 + 66, train_prompts),
+                                              cfg.seed * 1000 + 66, train_prompts,
+                                              index=fq_index),
         "factqa_fresh": factqa.generate_fresh_entity_eval(fresh, cfg.n_fresh_eval,
                                                           cfg.seed * 1000 + 77),
         "recall": bios.recall_probes(records,
                                      min(cfg.n_recall_entities, cfg.n_entities),
                                      cfg.seed * 1000 + 88),
     }
+    _log("eval sets generated")
     for stem, items in evals.items():
         with open(eval_dir / f"{stem}.jsonl", "w") as f:
             for item in items:
                 f.write(json.dumps(asdict(item)) + "\n")
+    _log("eval sets written")
 
     # ---------------- report + checks --------------------------------------
     shares = cfg.shares()

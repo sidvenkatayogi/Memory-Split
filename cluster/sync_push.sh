@@ -14,6 +14,7 @@ ssh -o ControlPath="$SOCK" "$SUNET_ID@$HOST" "mkdir -p $DEST"
 rsync -az --delete \
     --exclude '.git' --exclude '.venv' --exclude 'data' --exclude 'outputs' \
     --exclude '__pycache__' --exclude '.pytest_cache' \
+    --exclude 'slurm-*.out' --exclude 'setup_env.log' \
     -e "ssh -o ControlPath=$SOCK" \
     "$REPO_DIR/" "$SUNET_ID@$HOST:$DEST/"
 echo "pushed -> $HOST:$DEST"
