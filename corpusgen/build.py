@@ -55,12 +55,18 @@ class BuildCfg:
     n_entities: int
     total_tokens: int
     seed: int
-    bed_share: float = 0.62
+    # Shares amended 2026-07-19 per gate-A remediation (spec section 7:
+    # "raise reasoning share once"): bed 0.62 -> 0.54, igsm 0.07 -> 0.12,
+    # deduction 0.05 -> 0.08. Gate-budget pilots left both reasoning tasks
+    # at chance; fact dose (0.23) and factqa (0.03) unchanged.
+    bed_share: float = 0.54
     bio_share: float = 0.23
-    igsm_share: float = 0.07
-    deduction_share: float = 0.05
+    igsm_share: float = 0.12
+    deduction_share: float = 0.08
     factqa_share: float = 0.03
-    igsm_op: tuple[int, int] = (2, 8)
+    # Train op narrowed 2-8 -> 2-6 in the same remediation (fewer solution
+    # templates per token budget); 7-9 becomes the OOD band at eval.
+    igsm_op: tuple[int, int] = (2, 6)
     deduction_depth: tuple[int, int] = (1, 4)
     n_igsm_eval: int = 10_000
     n_deduction_eval: int = 10_000

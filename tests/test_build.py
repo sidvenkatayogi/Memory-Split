@@ -166,7 +166,7 @@ CFG = BuildCfg(
     n_fresh_eval=24,
 )
 
-TARGETS = {"bed": 0.62, "bio": 0.23, "igsm": 0.07, "deduction": 0.05, "factqa": 0.03}
+TARGETS = CFG.shares()  # whatever the current preregistered mixture is
 
 
 @pytest.fixture(scope="module")

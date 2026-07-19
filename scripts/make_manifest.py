@@ -77,15 +77,20 @@ def main() -> None:
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--out-root", default="outputs")
     ap.add_argument("--top-load", default="n800k", choices=list(LOADS))
+    ap.add_argument("--gate-tokens", type=int, default=GATE_TOKENS)
+    ap.add_argument("--gate-loads", default=None,
+                    help="comma list; default all sweep loads + split n200k")
     args = ap.parse_args()
 
     jobs: list[tuple[str, dict]] = []
     if args.stage == "gates":
-        for load in SWEEP_LOADS:  # gate A+B: dense across loads
-            jobs.append(make_cfg("d160m", "dense", load, 0, args.data_root,
-                                 args.out_root, GATE_TOKENS, data_tag="_gate"))
-        jobs.append(make_cfg("d160m", "split", "n200k", 0, args.data_root,
-                             args.out_root, GATE_TOKENS, data_tag="_gate"))
+        gate_loads = (args.gate_loads.split(",") if args.gate_loads
+                      else list(SWEEP_LOADS) + ["split:n200k"])
+        for spec_load in gate_loads:
+            arm, load = (spec_load.split(":") if ":" in spec_load
+                         else ("dense", spec_load))
+            jobs.append(make_cfg("d160m", arm, load, 0, args.data_root,
+                                 args.out_root, args.gate_tokens, data_tag="_gate"))
     elif args.stage == "sweep":
         for load in SWEEP_LOADS:
             for arm in ("dense", "split"):
