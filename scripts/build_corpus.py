@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 from pathlib import Path
 
 from corpusgen.build import LOADS, BuildCfg, build_corpus
@@ -63,6 +64,8 @@ def main() -> None:
     ap.add_argument("--bed-file", default=None)
     ap.add_argument("--total-tokens", type=int, default=None)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--workers", type=int,
+                    default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
     args = ap.parse_args()
 
     tok = get_tok()
@@ -76,6 +79,7 @@ def main() -> None:
             n_entities=LOADS[load],
             total_tokens=total,
             seed=args.seed,
+            workers=args.workers,
         )
         bed = bed_iter_file(args.bed_file) if args.bed_file else bed_iter_hf()
         report = build_corpus(cfg, tok, bed, out_dir)

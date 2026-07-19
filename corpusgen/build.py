@@ -55,6 +55,7 @@ class BuildCfg:
     n_entities: int
     total_tokens: int
     seed: int
+    workers: int = 1  # >1 parallelizes generation+encoding (deterministic)
     # Shares amended 2026-07-19 per gate-A remediation (spec section 7:
     # "raise reasoning share once"): bed 0.62 -> 0.54, igsm 0.07 -> 0.12,
     # deduction 0.05 -> 0.08. Gate-budget pilots left both reasoning tasks
@@ -150,11 +151,66 @@ def _encode(tok, doc: Doc, arm: str) -> tuple[np.ndarray, np.ndarray | None]:
     return ids_arr, None
 
 
+# ---------------- parallel generation workers ------------------------------
+# Module-level state initialized once per pool worker (spawn-safe). Workers
+# regenerate the entity records deterministically instead of receiving a
+# multi-GB pickle. Tests exercise workers=1 (in-process) and byte-identity
+# between workers=1 and workers>1.
+
+_WSTATE: dict = {}
+
+
+def _pool_init(records_args: tuple | None) -> None:
+    from train.tokenizer import get_tok as _get_tok
+
+    _WSTATE["tok"] = _get_tok()
+    if records_args is not None:
+        n_entities, n_fresh, seed = records_args
+        recs = bios.generate_records(n_entities + n_fresh, seed)[:n_entities]
+        _WSTATE["records"] = recs
+        _WSTATE["fq_index"] = factqa.birth_city_index(recs)
+
+
+def _pool_gen_batch(task: tuple) -> list[tuple]:
+    """(kind, seed, lo, hi, n_docs) -> [(doc, enc_dense, enc_split), ...]"""
+    kind, seed, lo, hi, n_docs = task
+    tok = _WSTATE["tok"]
+    if kind == "igsm":
+        mod = importlib.import_module("corpusgen.igsm_lite")
+        docs = mod.generate_igsm_docs(n_docs, lo, hi, seed)
+    elif kind == "deduction":
+        mod = importlib.import_module("corpusgen.deduction")
+        docs = mod.generate_deduction_docs(n_docs, lo, hi, seed)
+    elif kind == "factqa":
+        docs = factqa.generate_factqa_docs(
+            _WSTATE["records"], n_docs, seed, index=_WSTATE["fq_index"]
+        )
+    elif kind == "bed":
+        raise ValueError("bed is encoded via _pool_encode_bed")
+    else:
+        raise ValueError(kind)
+    return [(doc, _encode(tok, doc, "dense"), _encode(tok, doc, "split")) for doc in docs]
+
+
+
+
 def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | str) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     igsm = importlib.import_module("corpusgen.igsm_lite")
     deduction = importlib.import_module("corpusgen.deduction")
+
+    pool = None
+    if cfg.workers > 1:
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(
+            cfg.workers,
+            initializer=_pool_init,
+            initargs=((cfg.n_entities, cfg.n_fresh_entities, cfg.seed),),
+        )
+        _log(f"worker pool: {cfg.workers} processes")
 
     budgets = {c: int(round(s * cfg.total_tokens)) for c, s in cfg.shares().items()}
 
@@ -179,16 +235,34 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
     # ---------------- shared synthetic components --------------------------
     # Generate until the MEAN of the two renderings' token counts reaches the
     # budget, so each arm's share deviation is at most half the wrapping cost.
-    def generate_until(gen_batch, budget: int, label: str) -> tuple[list[Doc], list[tuple], list[tuple]]:
+    _BATCH = 64
+    fq_index = factqa.birth_city_index(records)  # once, not per 64-doc batch
+
+    def _make_batch_inline(kind: str, lo: int, hi: int, offset: int, i: int):
+        seed = cfg.seed * 1000 + offset + _BATCH * i
+        if kind == "igsm":
+            docs = igsm.generate_igsm_docs(_BATCH, lo, hi, seed)
+        elif kind == "deduction":
+            docs = deduction.generate_deduction_docs(_BATCH, lo, hi, seed)
+        else:
+            docs = factqa.generate_factqa_docs(records, _BATCH, seed, index=fq_index)
+        return [(doc, _encode(tok, doc, "dense"), _encode(tok, doc, "split"))
+                for doc in docs]
+
+    def generate_until(kind: str, lo: int, hi: int, offset: int, budget: int,
+                       label: str) -> tuple[list[Doc], list[tuple], list[tuple]]:
+        """Consume deterministic 64-doc batches (batch i uses seed
+        cfg.seed*1000 + offset + 64*i) in order until the mean-of-renderings
+        token budget is met. Identical output for any workers setting."""
         docs: list[Doc] = []
         enc_dense: list[tuple] = []
         enc_split: list[tuple] = []
         mean_total = 0.0
         next_log = budget / 8
-        while mean_total < budget:
-            for doc in gen_batch(len(docs)):
-                d = _encode(tok, doc, "dense")
-                s = _encode(tok, doc, "split")
+
+        def consume(batch) -> bool:
+            nonlocal mean_total, next_log
+            for doc, d, s in batch:
                 docs.append(doc)
                 enc_dense.append(d)
                 enc_split.append(s)
@@ -197,28 +271,43 @@ def build_corpus(cfg: BuildCfg, tok, bed_iter: Iterator[str], out_dir: Path | st
                     _log(f"{label}: {mean_total/1e6:.0f}M/{budget/1e6:.0f}M tokens, {len(docs)} docs")
                     next_log += budget / 8
                 if mean_total >= budget:
-                    break
+                    return True
+            return False
+
+        i = 0
+        done = False
+        while not done:
+            if pool is None:
+                done = consume(_make_batch_inline(kind, lo, hi, offset, i))
+                i += 1
+            else:
+                # probe two batches inline to size a bounded parallel map
+                if i < 2:
+                    done = consume(_make_batch_inline(kind, lo, hi, offset, i))
+                    i += 1
+                    continue
+                per_batch = mean_total / i
+                need = max(cfg.workers, int((budget - mean_total) / per_batch * 1.1) + 1)
+                tasks = [(kind, cfg.seed * 1000 + offset + _BATCH * j, lo, hi, _BATCH)
+                         for j in range(i, i + need)]
+                for batch in pool.imap(_pool_gen_batch, tasks, chunksize=1):
+                    done = consume(batch)
+                    if done:
+                        break
+                i += need
         _log(f"{label}: done ({len(docs)} docs)")
         return docs, enc_dense, enc_split
 
-    def igsm_batch(start: int):
-        return igsm.generate_igsm_docs(64, cfg.igsm_op[0], cfg.igsm_op[1],
-                                       cfg.seed * 1000 + 11 + start)
-
-    def ded_batch(start: int):
-        return deduction.generate_deduction_docs(64, cfg.deduction_depth[0],
-                                                 cfg.deduction_depth[1],
-                                                 cfg.seed * 1000 + 22 + start)
-
-    fq_index = factqa.birth_city_index(records)  # once, not per 64-doc batch
-
-    def factqa_batch(start: int):
-        return factqa.generate_factqa_docs(records, 64, cfg.seed * 1000 + 33 + start,
-                                           index=fq_index)
-
-    igsm_docs, igsm_d, igsm_s = generate_until(igsm_batch, budgets["igsm"], "igsm")
-    ded_docs, ded_d, ded_s = generate_until(ded_batch, budgets["deduction"], "deduction")
-    fq_docs, fq_d, fq_s = generate_until(factqa_batch, budgets["factqa"], "factqa")
+    igsm_docs, igsm_d, igsm_s = generate_until(
+        "igsm", cfg.igsm_op[0], cfg.igsm_op[1], 11, budgets["igsm"], "igsm")
+    ded_docs, ded_d, ded_s = generate_until(
+        "deduction", cfg.deduction_depth[0], cfg.deduction_depth[1], 22,
+        budgets["deduction"], "deduction")
+    fq_docs, fq_d, fq_s = generate_until(
+        "factqa", 0, 0, 33, budgets["factqa"], "factqa")
+    if pool is not None:
+        pool.close()
+        pool.join()
 
     # ---------------- bed (identical across arms; ids only, mask implicit) --
     bed_hasher = hashlib.sha1()

@@ -305,6 +305,34 @@ def test_eval_files_exist_and_parse(built):
 # ---------------------------------------------------------------- determinism
 
 
+def test_parallel_workers_byte_identical(tmp_path):
+    """workers>1 must produce byte-identical corpora to workers=1.
+
+    Uses the REAL reasoning generators (not stubs): the worker pool imports
+    corpusgen.igsm_lite / corpusgen.deduction in fresh processes, so stubbed
+    sys.modules would not propagate anyway.
+    """
+    import dataclasses
+
+    small = dataclasses.replace(CFG, n_entities=30, total_tokens=30_000,
+                                n_igsm_eval=5, n_deduction_eval=5,
+                                n_factqa_eval=10, n_fresh_entities=10,
+                                n_fresh_eval=5)
+    reports = {}
+    for label, workers in (("serial", 1), ("parallel", 2)):
+        cfg = dataclasses.replace(small, workers=workers)
+        reports[label] = build_corpus(cfg, get_tok(), bed_fixture(), tmp_path / label)
+    # cfg.workers legitimately differs; everything measured must not
+    for r in reports.values():
+        r["cfg"].pop("workers")
+    assert reports["serial"] == reports["parallel"]
+    for arm in ("dense", "split"):
+        for fname in ("train.bin", "train.mask.bin"):
+            a = (tmp_path / "serial" / arm / fname).read_bytes()
+            b = (tmp_path / "parallel" / arm / fname).read_bytes()
+            assert a == b, (arm, fname)
+
+
 def test_rerun_byte_identical(tmp_path):
     reports = []
     for sub in ("a", "b"):
