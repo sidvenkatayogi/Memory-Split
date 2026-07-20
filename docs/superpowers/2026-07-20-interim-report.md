@@ -293,7 +293,7 @@ exposure/interference rather than the 2-bits/param ceiling; the
 preregistration will state this, and the 1B calibration stage picks the
 dose that binds at scale before any confirmation GPU-day is spent.
 
-### 6.3 Reasoning-task learnability (gate A — remediated, verdict pending splice)
+### 6.3 Reasoning-task learnability (gate A — remediated, retry in flight)
 
 First-round pilots put both knowledge-free reasoning tasks at their chance
 floors (iGSM ~4% vs 4.3% chance; deduction ~44% vs 50%) — the 7%+5%
@@ -303,8 +303,14 @@ The spec-prescribed remediation was applied once: reasoning share raised
 to 12%+8%, training difficulty band narrowed (op 2-6), corpus rebuilt, and
 the dense/split pilot pair rerun.
 
-> **[GATE-A RETRY VERDICT — to be spliced from
-> outputs/d160m_{dense,split}_n200k_s0_gate/evals/summary.json]**
+Status at writing (2026-07-20 10:15): the remediated dense pilot has
+finished training — its final language-modeling loss improved from 2.60 to
+2.37 versus round one, consistent with the corpus change taking effect —
+and its eval battery is queued behind other groups' GPU jobs; the split
+pilot completes training within the hour. The gate verdict (iGSM and
+deduction accuracy under the new mixture) lands today and gates the sweep
+submission, not this report's mechanism claims, which are all round-one
+measurements unaffected by the remediation.
 
 ### 6.4 Honest ledger
 
