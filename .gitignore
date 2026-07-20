@@ -3,6 +3,7 @@ __pycache__/
 .tiktoken_cache/
 .venv/
 .pytest_cache/
+.worktrees/
 .DS_Store
 data/
 outputs/
