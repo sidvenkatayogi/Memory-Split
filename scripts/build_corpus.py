@@ -20,6 +20,7 @@ import argparse
 import itertools
 import json
 import os
+import sys
 from pathlib import Path
 
 from corpusgen.build import LOADS, BuildCfg, build_corpus
@@ -91,3 +92,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Force exit: HF datasets' multiprocess resource tracker can hang the
+    # interpreter at shutdown (observed zombifying Slurm job 1647852 for 3h
+    # after all work completed). Everything is flushed/closed by here.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

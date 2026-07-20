@@ -107,6 +107,16 @@ one platform). The 1B top-load paired contrast is protected last.
   if the data job is requeued/resubmitted, resubmit the gate runs against
   the new job id (afterok on a FAILED job leaves them pending forever —
   cancel with `scancel` and resubmit).
+- **Zombie data jobs**: HF datasets' resource tracker can hang the Python
+  interpreter at exit AFTER all work is done (job 1647852 sat RUNNING 3h
+  post-completion, stalling its afterok chain). scripts/build_corpus.py now
+  ends with `os._exit(0)`; if a data job looks stuck, check whether
+  report.json already exists before assuming the build itself is slow.
+- **Mixture provenance**: corpora carry the BuildCfg in report.json. After
+  the 2026-07-19 gate-A remediation (bed .54 / igsm .12 / ded .08, op 2-6),
+  every corpus built earlier (old 62/7/5 mixture) is STALE for battery use
+  and must be rebuilt after the gate-A retry verdict: n50k, n200k, n800k,
+  n800k_1b, n4m_1b.
 
 ## Known facts (recon 2026-07-12/13 + this bring-up)
 
