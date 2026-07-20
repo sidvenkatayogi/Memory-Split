@@ -1,7 +1,7 @@
 # MemorySplit Architecture and Scale Decision
 
-Date: 2026-07-20  
-Owner: Stephen Zhang  
+Date: 2026-07-20
+Owner: Stephen Zhang
 Status: approved section-by-section in session; written-spec review pending
 
 ## 1. Decision
@@ -490,4 +490,3 @@ the implementation plan after this specification is reviewed.
 - Compute-optimal skills: https://arxiv.org/abs/2503.10061
 - Optimal MoE sparsity for reasoning: https://arxiv.org/abs/2508.18672
 - Capacity-aware mixture optimization: https://arxiv.org/abs/2603.08022
-
