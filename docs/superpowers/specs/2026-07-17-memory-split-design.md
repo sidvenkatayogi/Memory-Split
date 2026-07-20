@@ -119,8 +119,15 @@ scaling point if the calendar allows. Total compute is roughly unchanged.)
 
 ### 3.4 Endpoint and decision rule
 
-- **Primary endpoint:** knowledge-free reasoning composite = mean of
-  iGSM-lite held-out accuracy and deduction held-out accuracy
+**(SUPERSEDED 2026-07-20.** After three gate-A rounds showed knowledge-free
+reasoning tasks unlearnable in-mixture at pilot budget, the primary
+endpoint was re-anchored to fact-use QA with iGSM/deduction as
+emergence-watch secondaries. The frozen, authoritative battery definition
+is `docs/superpowers/specs/2026-07-20-preregistration.md`. The original
+text below is retained for the record.)
+
+- **Primary endpoint (original):** knowledge-free reasoning composite =
+  mean of iGSM-lite held-out accuracy and deduction held-out accuracy
   (in-distribution difficulty), >= 10k items each. Multi-hop fact-use
   accuracy (split scored with organizer; dense closed-book) is co-reported
   as the "system-level" reasoning-over-knowledge secondary — it conflates
