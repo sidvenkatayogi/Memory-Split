@@ -150,8 +150,11 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
     query = internals[-1]
     needed = list(val)  # every quantity so far is in the query's closure
 
-    # Distractor definitions: 0-3 statements never needed for the answer.
-    for _ in range(rng.randint(0, 3)):
+    # Distractor definitions, never needed for the answer. Difficulty floor
+    # (2026-07-20 gate-A decision): easy problems carry at most one
+    # distractor so dependency tracing is learnable before it is hard.
+    max_distractors = 1 if op <= 2 else 3
+    for _ in range(rng.randint(0, max_distractors)):
         if rng.random() < 0.5:
             new_leaf()
         else:
@@ -259,18 +262,25 @@ def solve_from_prompt(prompt: str) -> int:
     return ev(qm.group(1))
 
 
-def _problem_stream(rng: random.Random, op_lo: int, op_hi: int):
+def _problem_stream(rng: random.Random, op_lo: int, op_hi: int,
+                    low_weighted: bool = False):
+    ops = list(range(op_lo, op_hi + 1))
+    weights = [1.0 / k for k in ops] if low_weighted else None
     while True:
-        yield generate_problem(rng.randint(op_lo, op_hi), rng)
+        op = rng.choices(ops, weights)[0] if weights else rng.randint(op_lo, op_hi)
+        yield generate_problem(op, rng)
 
 
-def generate_igsm_docs(n_docs: int, op_lo: int, op_hi: int, seed: int) -> list[Doc]:
+def generate_igsm_docs(n_docs: int, op_lo: int, op_hi: int, seed: int,
+                       low_weighted: bool = True) -> list[Doc]:
+    """Training docs weight difficulty toward low op (1/op mass) so the
+    easiest levels dominate early learning; eval stays uniform per op."""
     rng = random.Random(seed)
     seen: set[str] = set()
     docs: list[Doc] = []
     if n_docs <= 0:
         return docs
-    for p in _problem_stream(rng, op_lo, op_hi):
+    for p in _problem_stream(rng, op_lo, op_hi, low_weighted=low_weighted):
         if p.structure_hash in seen:
             continue
         seen.add(p.structure_hash)

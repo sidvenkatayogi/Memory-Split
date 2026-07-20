@@ -65,10 +65,12 @@ class BuildCfg:
     igsm_share: float = 0.12
     deduction_share: float = 0.08
     factqa_share: float = 0.03
-    # Train op narrowed 2-8 -> 2-6 in the same remediation (fewer solution
-    # templates per token budget); 7-9 becomes the OOD band at eval.
-    igsm_op: tuple[int, int] = (2, 6)
-    deduction_depth: tuple[int, int] = (1, 4)
+    # Difficulty floor (2026-07-20, gate-A decision "option B"): op 1-4
+    # with 1/op-weighted training mass and <=1 distractor at op<=2; depth
+    # 1-2. Bands above become OOD report-only. Prior bands: op 2-8 (v1),
+    # 2-6 (first remediation); depth 1-4.
+    igsm_op: tuple[int, int] = (1, 4)
+    deduction_depth: tuple[int, int] = (1, 2)
     n_igsm_eval: int = 10_000
     n_deduction_eval: int = 10_000
     n_factqa_eval: int = 2_000

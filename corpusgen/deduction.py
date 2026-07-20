@@ -147,7 +147,11 @@ def _build(
 
     rules: list[Rule] = list(chain_rules)
     unsafe_heads = set(chain) | set(helper_pool)
-    n_rules = rng.randint(max(3, len(rules)), 8)
+    # Difficulty floor (2026-07-20 gate-A decision): shallow problems get
+    # small rule/fact bases so the chaining schema is learnable before the
+    # distraction load grows.
+    max_rules = 4 if depth <= 2 else 8
+    n_rules = rng.randint(max(3, len(rules)), max(max_rules, len(rules)))
     tries = 0
     while len(rules) < n_rules and tries < 300:
         tries += 1
@@ -163,7 +167,8 @@ def _build(
     # Lower bound clamped so an overfull candidate (possible at OOD depths
     # 5-6 in the mirror branch) falls through to validation and retries
     # instead of raising in randint.
-    n_facts = rng.randint(min(max(4, len(facts)), 10), 10)
+    max_facts = 6 if depth <= 2 else 10
+    n_facts = rng.randint(min(max(4, len(facts)), max_facts), max_facts)
     tries = 0
     while len(facts) < n_facts and tries < 300:
         tries += 1
@@ -185,7 +190,9 @@ def generate_problem(depth: int, rng: random.Random, answer_yes: bool) -> DedPro
 
     for _ in range(_MAX_TRIES):
         query, facts, rules, chain_rules, chain_base = _build(depth, rng, answer_yes)
-        if not (4 <= len(facts) <= 10 and 3 <= len(rules) <= 8):
+        max_facts = 6 if depth <= 2 else 10
+        max_rules = 4 if depth <= 2 else 8
+        if not (4 <= len(facts) <= max_facts and 3 <= len(rules) <= max_rules):
             continue
         closure = forward_chain(facts, rules)
         if answer_yes:
