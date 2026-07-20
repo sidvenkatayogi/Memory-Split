@@ -314,17 +314,33 @@ computation does not emerge from a 20% in-mixture share at 0.8B tokens and
 160M params, at least not at op>=2 / depth>=1 difficulty.
 
 This is the gate system doing its job at pilot cost: roughly 8 GPU-hours
-bought the finding before the ~550-GPU-hour battery was committed. The
-spec's single-remediation path is exhausted; the decision now moves to the
-preregistration owner, with three costed options: (a) proceed to the
-full-budget sweep (4x tokens) with a mid-training kill checkpoint on the
-dense arm's iGSM curve; (b) floor the task difficulty (op 2-4 with heavier
-low-op mass, depth 1-2, atomic-answer formats) and re-gate in ~1 day;
-(c) re-anchor the primary endpoint on reasoning-over-facts (fact-use QA),
-which is robustly above chance and shows the largest split-vs-dense
-separation, at the cost of measuring "reasoning with store access" rather
-than knowledge-free capacity. Options (a) and (b) compose; (c) is the
-preregistered fallback if reasoning tasks stay at floor at full budget.
+bought the finding before the ~550-GPU-hour battery was committed.
+
+**Round three (difficulty floor; evals completed 2026-07-20 ~14:30 PT).**
+Option (b) was executed same-day: iGSM floored to op 1-4 with 1/op-weighted
+training mass and <=1 distractor on easy problems; deduction floored to
+depth 1-2 with small fact/rule bases. The verdict is unambiguous: dense
+iGSM 3.2% / split 5.6% (chance ~4.3%); deduction 53.7% / 53.1% (chance
+50%). Even single-operation modular arithmetic does not become reliably
+executable from a 20% in-mixture share at 0.8B tokens and 160M params —
+consistent with the interpretation that mod-23 arithmetic *tables* (not
+just multi-step composition) need drilling exposure far beyond one pass.
+Meanwhile the mechanism results replicated a third time (split: 99.4%
+recall ON / 0.0% OFF, 0.0 fact-bits, 99.6% fresh-entity lookups, fact-use
+QA 58.1% vs dense 31.2%).
+
+Three pilot rounds constitute a real, reportable secondary finding:
+**in-mixture acquisition of knowledge-free symbolic reasoning does not
+occur at pilot scale/budget**, across mixture shares (12-20%), difficulty
+bands (op 1-8, depth 1-4), and curricula (uniform, low-weighted). The
+remaining fork for the primary endpoint: (a) full-budget bet — the sweep's
+4x tokens may drill the arithmetic through (measured for free either way,
+since the reasoning components remain in the corpus); (c) the
+preregistered fallback — re-anchor H1's primary on fact-use QA, which is
+robustly above chance in every round and shows the largest, most stable
+split-vs-dense separation (+25 to +38 points). Recommendation: adopt (c)
+as primary with (a) as an emergence-watch secondary; freeze both in the
+preregistration.
 
 ### 6.4 Honest ledger
 
