@@ -303,14 +303,28 @@ The spec-prescribed remediation was applied once: reasoning share raised
 to 12%+8%, training difficulty band narrowed (op 2-6), corpus rebuilt, and
 the dense/split pilot pair rerun.
 
-Status at writing (2026-07-20 10:15): the remediated dense pilot has
-finished training — its final language-modeling loss improved from 2.60 to
-2.37 versus round one, consistent with the corpus change taking effect —
-and its eval battery is queued behind other groups' GPU jobs; the split
-pilot completes training within the hour. The gate verdict (iGSM and
-deduction accuracy under the new mixture) lands today and gates the sweep
-submission, not this report's mechanism claims, which are all round-one
-measurements unaffected by the remediation.
+**Retry verdict (evals completed 2026-07-20 ~10:00 PT).** The doubled
+reasoning share did not unlock the tasks at pilot budget: dense iGSM 4.5%
+(chance ~4.3%), deduction 45.1% (chance 50%); split 3.6% / 45.9%. Language
+modeling clearly improved under the new mixture (final loss 2.60 -> 2.37)
+and every mechanism measurement replicated (split: recall 99.8% ON / 0.0%
+OFF, 0.0 fact-bits in weights, 100% fresh-entity lookups, fact-use QA
+56.9% vs dense 27.1%) — the failure is specific: multi-step symbolic
+computation does not emerge from a 20% in-mixture share at 0.8B tokens and
+160M params, at least not at op>=2 / depth>=1 difficulty.
+
+This is the gate system doing its job at pilot cost: roughly 8 GPU-hours
+bought the finding before the ~550-GPU-hour battery was committed. The
+spec's single-remediation path is exhausted; the decision now moves to the
+preregistration owner, with three costed options: (a) proceed to the
+full-budget sweep (4x tokens) with a mid-training kill checkpoint on the
+dense arm's iGSM curve; (b) floor the task difficulty (op 2-4 with heavier
+low-op mass, depth 1-2, atomic-answer formats) and re-gate in ~1 day;
+(c) re-anchor the primary endpoint on reasoning-over-facts (fact-use QA),
+which is robustly above chance and shows the largest split-vs-dense
+separation, at the cost of measuring "reasoning with store access" rather
+than knowledge-free capacity. Options (a) and (b) compose; (c) is the
+preregistered fallback if reasoning tasks stay at floor at full budget.
 
 ### 6.4 Honest ledger
 
@@ -324,11 +338,13 @@ tested, and the compute plan is measured rather than hoped.
 
 ## 7. Schedule
 
-Gates + preregistration freeze -> 160M sweep (12 runs, ~1-2 days) + 1B
-dose calibration (2 short runs) -> 1B confirmation (4 chained runs,
-~6 days across all four free GPUs) -> analysis and month-end report with
-the measured delta or defensible null. Land date ~Jul 28-29 on the free
-tier alone, assuming ordinary queue contention.
+Gate-A resolution (section 6.3 decision) -> preregistration freeze ->
+160M sweep (12 runs, ~1-2 days) + 1B dose calibration (2 short runs) ->
+1B confirmation (4 chained runs, ~6 days across all four free GPUs) ->
+analysis and month-end report with the measured delta or defensible null.
+Land date ~Jul 28-30 on the free tier if the gate-A decision lands
+2026-07-20/21; the difficulty-floor option (b) costs about one calendar
+day, absorbed by CPU/GPU overlap.
 
 ## 8. The compute case
 
