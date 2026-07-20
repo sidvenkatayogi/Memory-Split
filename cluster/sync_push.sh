@@ -15,6 +15,7 @@ rsync -az --delete \
     --exclude '.git' --exclude '.venv' --exclude 'data' --exclude 'outputs' \
     --exclude '__pycache__' --exclude '.pytest_cache' \
     --exclude 'slurm-*.out' --exclude 'setup_env.log' \
+    --exclude 'configs/gen' \
     -e "ssh -o ControlPath=$SOCK" \
     "$REPO_DIR/" "$SUNET_ID@$HOST:$DEST/"
 echo "pushed -> $HOST:$DEST"
