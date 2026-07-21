@@ -1,0 +1,28 @@
+{
+  "toy_pair": {
+    "cka_fact_prompts": {
+      "0": 0.443,
+      "1": 0.359,
+      "2": 0.38,
+      "3": 0.386
+    },
+    "cka_reasoning_prompts": {
+      "0": 0.473,
+      "1": 0.472,
+      "2": 0.442,
+      "3": 0.301
+    },
+    "fact_unit_overlap_dense_vs_split": {
+      "overlap": 0.039,
+      "n_a": 40,
+      "n_b": 40,
+      "n_shared": 3
+    },
+    "w2_eff_rank_dense_minus_split": {
+      "0": 0.91,
+      "1": 1.57,
+      "2": 0.76,
+      "3": 2.38
+    }
+  }
+}
