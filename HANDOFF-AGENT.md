@@ -110,6 +110,12 @@ working; if it does not hold, stop and escalate.
 
 ## 5. The one decision: calib rule (preregistered, mechanical)
 
+> Scope note for role-card agents (ROLE-A / ROLE-B): applying this rule
+> and submitting the confirmation is NOT your job. Account A reports the
+> two calibration numbers to Stephen and stops; the confirmation runs on
+> AWS (section 10) under Stephen's control. This section remains for the
+> AWS operator.
+
 When both calib1b runs have evals:
 
 ```bash
@@ -192,39 +198,23 @@ The battery splits across two accounts, A and B. Rules first: a seed pair
 one account; both accounts run the same zip and the same setup_env (same
 torch wheels); results merge at analysis time by run name.
 
-Assignment:
+Assignment (role cards at the zip root are authoritative for each agent:
+ROLE-A.md for the corpus host, ROLE-B.md for the reader):
 
-- **Account A (corpus host).** Runs `bash cluster/run_battery.sh` as
-  written EXCEPT edit the sweep loop to skip seed-1 configs (or simply
-  scancel the six `*_s1` jobs it submits). Hosts all corpora; runs both
-  calib1b runs; runs the three seed-0 sweep pairs; later runs the
-  confirmation seed-0 pair (`run_confirm.sh` submits both pairs; scancel
-  the `*_s1` chains, account B submits those).
-- **Account B.** Does NOT build corpora. After A's builds finish (every
-  report.json check true), set the data root to A's scratch and submit
-  only seed-1 configs:
-
-```bash
-# in B's repo clone, after A's corpora exist:
-DATA_A=/scratch/users/<accountA>/memorysplit_data
-PYTHONPATH=$PWD $VENV/bin/python scripts/make_manifest.py --stage sweep --data-root $DATA_A
-grep _s1 outputs/manifests/sweep.tsv > outputs/manifests/sweep_b.tsv
-while read cfg; do sbatch --exclude=wheat-01 --export=ALL,CONFIG="$cfg" \
-    cluster/slurm/train_single.sbatch; done < outputs/manifests/sweep_b.tsv
-# confirmation, after the calib rule (top load decided in A):
-PYTHONPATH=$PWD $VENV/bin/python scripts/make_manifest.py --stage confirm --top-load <winner> --data-root $DATA_A
-grep _s1 outputs/manifests/confirm.tsv | while read cfg; do bash cluster/submit_chain.sh "$cfg" 4; done
-```
-
-  Verify read access first (`head -c 100 $DATA_A/n50k/dense/train.bin`);
-  if scratch permissions block cross-account reads, B rebuilds its needed
-  loads with `data_prep.sbatch` and MUST verify byte-identity against A
-  before training: every value and digest in B's report.json must equal
-  A's (deterministic builds make this exact, not approximate).
+- **Account A (corpus host):** `bash cluster/run_battery.sh --role a` —
+  builds all corpora, runs the seed-0 sweep pairs and both calib1b runs.
+- **Account B (reader):** waits for A's corpora, then
+  `bash cluster/run_battery.sh --role b --data-root
+  /scratch/users/<accountA>/memorysplit_data` — runs the seed-1 sweep
+  pairs against A's corpora. The script verifies readability and refuses
+  to start early. Fallback if cross-account reads are blocked: B rebuilds
+  its loads and verifies byte-identity against A's report digests before
+  training.
 - **Account A must not delete corpora until B's runs are all finished.**
-- Both accounts run `run_evals_pending.sh` for their own runs. Handback:
-  B rsyncs its `outputs/` into A's tree (run names are globally unique),
-  then A runs the analysis step from section 6 over the merged tree.
+- Both accounts run `run_evals_pending.sh` for their own runs and hand
+  back `outputs/*/evals`, `outputs/*/log.jsonl`, and `outputs/manifests`
+  as a tarball (see role cards). Analysis runs once over the merged
+  tree; run names are globally unique.
 
 What this buys: the sweep+calib phase compresses to under a day, storage
 splits across accounts, and each account carries one whole confirmation
