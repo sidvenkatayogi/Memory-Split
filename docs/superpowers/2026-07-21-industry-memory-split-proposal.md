@@ -308,7 +308,7 @@ limit, stated openly.
 |---|---|---|---|
 | 1 | Tier-S canonicalization = entity linking (RT-2) | M | Tier-C + discriminators + entity-ANN carry non-copyable referents; alias rows are first-class facts; mis-keying reported stratified by ambiguity |
 | 2 | Fingerprint verifies key, not referent (RT-2) | E/M | Mandatory disambiguator qualifiers; per-entity type+description discriminator echoed and store-checked; mention-similarity vote; residual = genuine underdetermination → abstain (L1) |
-| 3 | Held-out key memorization (our 2.5%) (RT-1) | E/M | Copy-constrained decoding makes memorized keys unemittable — **measured, Section 9**: full-key 0→24.3%, silent-wrong 33.5%→0.83%; residual is span ranking (74.6% wrong-in-context at 29M), carried by the pointer-ranking loss at 160M and caught by mention-similarity verification meanwhile |
+| 3 | Held-out key memorization (our 2.5%) (RT-1) | E/M | Copy-constrained decoding makes memorized keys unemittable — **measured, Section 9**: full-key 0→24.3% (arm B, same checkpoint); within-arm silent-wrong 34.0%→1.2% under strict ship-on-hit, →0% with one name-echo vote; residual is span ranking (74.6% wrong-in-context at 29M), carried by the pointer-ranking loss at 160M and caught by mention-similarity verification meanwhile |
 | 4 | Tier-C unproven above 10^5 items (RT-3) | M | Gated by decision experiment BEFORE systems investment; v3.0 ships without Tier-C; failure demotes Tier-C to candidate generation |
 | 5 | OOV novel-name leaf chaos (RT-3) | M | Surface-orthographic leaf symbol; prefix-bucket + verify floor; rotation-held-out monitoring |
 | 6 | Quantizer codebook drift (RT-3) | M | Balanced RQ-KMeans (measured 100% utilization); versioned re-mints only, dual-serving; claim softened to "no model-coupled re-indexing" |
@@ -432,14 +432,19 @@ paradigm.
 
 ## 9. The fix, measured (2026-07-21)
 
-**Headline [M]:** copy-constrained decoding lifts held-out full-key accuracy
-**0.0% → 24.3%** and end-to-end answers **2.1% → 26.2%** from the *same
-checkpoint*, and under the deployable ship-on-store-hit policy it collapses
-silent-wrong answers **33.5% → 0.83% (40x)** at 25% coverage with **95.5%
-precision** — the baseline's hits were wrong-referent memorized keys 209 out
-of 209 times. The pre-registered ≥60% go-gate is NOT met at 29M (stated
-plainly); the structural claim and the verification story are established,
-and the bottleneck moved exactly where the architecture predicts.
+**Headline (single arm B = baseline checkpoint + constrained decoding;
+measured counts, derived ratios marked):** held-out full-key accuracy
+**0/606 → 147/606 (0.0% → 24.3%)** and end-to-end answers **2.1% → 26.2%**
+from the *same checkpoint* [M]. Under the deployable ship-on-store-hit
+policy with strict returned-value matching, arm B collapses silent-wrong
+answers **34.0% → 1.2% (~29x)** at 25.4% coverage and **95.5% precision**
+[M counts, I ratio]; adding one name-echo verification vote removes all
+residual silent-wrongs (147/147 = 100% precision) at 1.1pp coverage cost
+[M]. The baseline's store hits were wrong-referent memorized keys 209 out
+of 209 times [M]. The pre-registered ≥60% go-gate is **NOT met** at 29M
+(stated plainly); what is established is the structural lift and the
+verification story, and the bottleneck moved exactly where the architecture
+predicts [I].
 
 ### 9.1 Protocol
 
@@ -454,8 +459,11 @@ end-to-end answer, Wilson 95% CIs, n=606 held-out.
 
 ### 9.2 Arms
 
-- **A — baseline reproduction** (validates the recreated harness against the
-  07-20 numbers: name-half ≈ 2.5%, relation-half ≈ 98.5%).
+- **A — baseline reproduction** (validates the recreated harness by
+  reproducing the failure SIGNATURE, not the exact 07-20 numbers — different
+  PopQA snapshot/seeds/batch schedule: measured 0.0% name-half / 96.0%
+  relation-half here vs 2.5% / 98.5% on 07-20; in both, relation transfers
+  at ceiling while name-copy sits at or below chance).
 - **B — constrained decoding only**, applied to A's own checkpoint: isolates
   the inference-side fix. Gold-key emittability through the span trie:
   804/806 = 99.75% (2 structural misses: 11-word subjects beyond the n-gram
@@ -478,44 +486,54 @@ Emitted-key decomposition:
 | C copy-dominance retrain | 0.2 [0.0, 0.9] | 0.2 | 94.2 | 2.1 | 4.0 |
 | D = C + constraint | 23.6 [20.4, 27.1] | 24.6 | 94.1 | 25.7 | 73.3 |
 
-Governance view — the deployable "splice on store hit" policy, no gold labels:
+Governance view — selective shipping, strict returned-value matching
+(normalized store value must equal a listed answer; never a substring, never
+the continuation). P0 = ship on store hit; P1 = P0 + name-echo vote (oracle
+stand-in for mention-similarity):
 
-| Arm | Coverage | Precision shipped | Silent-wrong overall | Wrong-referent keys among hits |
-|---|---|---|---|---|
-| A | 34.5% | 2.9% | 33.5% | 209/209 |
-| B | 25.4% | **95.5%** | **1.16%** | 7 |
-| D | 24.6% | **96.6%** | **0.83%** | 6 |
+| Arm | P0 coverage | P0 precision | P0 silent-wrong | Wrong-referent hits | P1 coverage | P1 precision |
+|---|---|---|---|---|---|---|
+| A | 209/606 = 34.5% | 3/209 = 1.4% | 206/606 = 34.0% | 209/209 | 0% | — |
+| B | 154/606 = 25.4% | **147/154 = 95.5%** | **7/606 = 1.2%** | 7 | 147/606 = 24.3% | **147/147 = 100%** |
+| C | 213/606 = 35.1% | 7/213 = 3.3% | 206/606 = 34.0% | 212/213 | 0.2% | 1/1 |
+| D | 149/606 = 24.6% | **143/149 = 96.0%** | **6/606 = 1.0%** | 6 | 143/606 = 23.6% | **143/143 = 100%** |
 
 Seen split (n=200): A 5.0% full-key, B 63.0%, D **71.5%**. Mechanism intact in
-both trainings (masked-value CE ≈ 10 vs general loss ≈ 0.7). Emittability
+both trainings (masked-value CE ≈ 10 vs general loss ≈ 0.7) [M]. Emittability
 ceiling from span extraction: 99.75% (2 structural misses, counted as
-failures).
+failures) [M].
 
-### 9.4 Reading [M unless noted]
+### 9.4 Reading (counts [M]; every interpretation and ratio [I])
 
-1. **Arm A reproduces the 07-20 failure signature** (0.0 vs 2.5 name-half,
-   overlapping CIs on a drifted snapshot; relation-half ~96 vs 98.5) —
-   the recreated harness is validated and the failure is real, not an
-   artifact of the lost code.
-2. **The failure was emission, not knowledge**, for a quarter of held-out
-   items: the identical checkpoint jumps 0 → 24.3% full-key when memorized
-   junk becomes unemittable. The training-side fix alone (C) moved nothing
-   held-out at this scale, but improves span ranking where knowledge exists
-   (seen split: D 71.5% vs B 63.0%).
-3. **The baseline is dangerous, not just weak:** every one of its 209
-   held-out store hits was a memorized wrong-referent key — a naive splice
-   pipeline ships silently wrong values on a third of queries. The
-   constraint turns this into a selective system: 25% coverage at ~96%
-   precision, silent error down 40x, and stacking the name-echo check takes
-   arm B from 95.5% to 100% precision — the measured value of one
-   verification vote, which is the consensus architecture's thesis in
-   miniature.
-4. **The residual bottleneck is span RANKING (74.6% wrong-in-context)** — a
-   29M capability gap, not an architecture gap [I]: the project's 160M model
-   reached 100% on held-out synthetic names, and ranking is exactly what the
-   full Tier-S pointer loss trains. Go-gate honesty: 26.2 [22.9, 29.9] does
-   not meet the ≥60% bar; next rung is 160M + pointer-ranking loss, with
-   29M seeds 1–4 already dispatched to FarmShare.
+1. **Arm A reproduces the 07-20 failure signature qualitatively** [I]: 0.0
+   name-half here vs 2.5 then, relation-half 96.0 vs 98.5, on a drifted
+   snapshot with different seeds — the signature (relation at ceiling,
+   name-copy at/below chance) is unambiguous in both, so we treat the
+   recreated harness as validated and the failure as real.
+2. **We read the failure as emission, not knowledge, for a quarter of
+   items** [I from the measured arm contrast]: the identical checkpoint
+   jumps 0 → 24.3% full-key when memorized junk becomes unemittable. The
+   training-side fix alone (C) moved nothing held-out at this scale (1/606
+   vs 0/606). The seen-split interaction (D 143/200 = 71.5% vs B 126/200 =
+   63.0%) is a directional, single-seed observation that substitution may
+   help span ranking where knowledge exists — deferred to seeds 1–4.
+3. **The baseline is dangerous, not just weak** [M counts, I framing]:
+   every one of its 209 held-out store hits was a memorized wrong-referent
+   key, so a naive splice pipeline ships silently wrong values on a third
+   of queries (its 3 "correct" shipments are value coincidences). Within
+   arm B the constraint yields a selective system — 25.4% coverage, 95.5%
+   precision, silent error 34.0% → 1.2% (~29x; arm D: → 1.0%, ~34x) — and
+   stacking the name-echo vote removes ALL residual silent-wrongs (100%
+   precision) at 1.1pp coverage cost. That P0→P1 delta is the measured
+   value of one verification vote at this scale, the consensus
+   architecture's thesis in miniature.
+4. **The residual bottleneck is span RANKING (74.6% wrong-in-context [M])**
+   — read as a 29M capability gap, not an architecture gap [I]: the
+   project's 160M model reached 100% on held-out synthetic names, and
+   ranking is exactly what the full Tier-S pointer loss trains. Go-gate
+   honesty: 26.2 [22.9, 29.9] does not meet the ≥60% bar; next rung is
+   160M + pointer-ranking loss, with 29M seeds 1–4 already dispatched to
+   FarmShare.
 
 ---
 
@@ -553,5 +571,4 @@ and the governance/product claims stand under an H1 null.
 - Optimal sparsity: arXiv 2508.18672 — active-FLOPs / TPP decomposition [M]
 - MPHF/ribbon, RaBitQ, LSM, TIGER (2305.05065), OneRec (2506.13695), DSI, ReFactX (2508.16983), KARLA (2606.26807), Knowledge Objects (2603.17781), SLUNG/SPLM, MeKi, Memory³, MaskMoE (2407.09816), OLMoE (2409.02060), RAGCache/CacheBlend (serving corrections) — as discussed in the design sections [M/I as marked].
 - Internal: docs/superpowers/2026-07-20-interim-report.md; /2026-07-20-heldout-key-generalization-results.md (the failure this proposal fixes); data/keyguess_local/ (the fix measurement, this repo).
-
 

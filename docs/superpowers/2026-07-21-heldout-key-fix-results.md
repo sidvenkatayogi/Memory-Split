@@ -4,9 +4,12 @@
 `2026-07-20-heldout-key-generalization-results.md` (the 2.5% name-half
 failure). The lost harness was recreated from that doc's protocol and is now
 committed (`corpusgen/realfact.py`, `evals/keyguess.py`, `evals/constrain.py`,
-`scripts/run_keyguess_local.py`); reproduce with:
-`scripts/fetch_realfacts.py` then `scripts/run_keyguess_local.py --stage all`.
-Replication seeds run via `--seed N` (FarmShare: `cluster/slurm/keyguess_cpu.sbatch`).
+`scripts/run_keyguess_local.py`); reproduce with
+`scripts/run_keyguess_local.py --stage all` against the COMMITTED input
+snapshot `data/realfacts/popqa_clean.jsonl` (SHA-256 pinned in Caveats; do
+not refetch — upstream drifts). Replication seeds run via `--seed N`
+(FarmShare: `cluster/slurm/keyguess_cpu.sbatch`); policy tables regenerate
+via `scripts/analyze_keyguess_policy.py`.
 
 ## Question
 
@@ -47,7 +50,7 @@ Four arms; B/D differ from A/C only at decode time:
 
 Gold-key emittability through the span trie (hard gate for B/D): **804/806 =
 99.75%** — 2 structural misses (11-word subjects beyond the n-gram cap), so
-span extraction caps constrained-arm ceiling at 99.7%, not a model limit.
+span extraction caps the constrained-arm ceiling at 99.75%, not a model limit.
 Both trainings kept the mechanism intact (masked-value CE ≈ 10 vs general
 loss ≈ 0.7 at step 800: fact values were never learned into weights).
 
@@ -63,64 +66,95 @@ loss ≈ 0.7 at step 800: fact values were never learned into weights).
 Seen split (n = 200): A 5.0% full key, B 63.0%, C 4.0%, **D 71.5%** (all
 relation-half ≥ 93.5%).
 
-## Results — the governance view (ship-on-store-hit, no gold labels)
+## Results — the governance view (selective shipping policies)
 
-The deployable policy "splice whatever the store returns on a hit" separates
-the arms far more sharply than raw accuracy:
+Two deployable policies, recomputed by `scripts/analyze_keyguess_policy.py`
+(persisted in `policy_analysis.json`). **Matching rule:** a shipped answer is
+correct iff `normalize(store-returned value)` is exactly in the item's
+normalized `possible_answers` set — strict returned-value equality, never a
+substring, never the whole continuation. (The emitted-key table above uses
+continuation-level answer accuracy, a different, looser metric.)
 
-| Arm | Coverage (hit rate) | Precision among shipped | Silent-wrong (all items) | Wrong-referent keys among hits |
-|---|---|---|---|---|
-| A | 34.5% | **2.9%** | **33.5%** | 209/209 |
-| B | 25.4% | **95.5%** | **1.16%** | 7 |
-| C | 35.1% | 3.8% | 33.8% | 212/213 |
-| D | 24.6% | **96.6%** | **0.83%** | 6 |
+P0 = ship on store hit. P1 = ship on hit AND emitted name == gold subject
+(oracle stand-in for one mention-similarity verification vote).
+
+| Arm | P0 coverage | P0 precision | P0 silent-wrong | Wrong-referent keys among hits | P1 coverage | P1 precision |
+|---|---|---|---|---|---|---|
+| A | 209/606 = 34.5% | 3/209 = **1.4%** | 206/606 = **34.0%** | 209/209 | 0% | — |
+| B | 154/606 = 25.4% | 147/154 = **95.5%** | 7/606 = **1.2%** | 7 | 147/606 = 24.3% | 147/147 = **100%** |
+| C | 213/606 = 35.1% | 7/213 = 3.3% | 206/606 = 34.0% | 212/213 | 0.2% | 1/1 |
+| D | 149/606 = 24.6% | 143/149 = **96.0%** | 6/606 = **1.0%** | 6 | 143/606 = 23.6% | 143/143 = **100%** |
 
 The baseline is not merely unhelpful — it is actively dangerous: every one of
-its 209 held-out store hits is a memorized key for the WRONG referent, so a
-naive splice pipeline would ship silently wrong values on a third of all
-queries. The copy constraint converts that into a selective system: a quarter
-of queries answered at ~96% precision, silent error collapsed **33.5% → 0.83%
-(40x)**, and the residual six wrong-referent hits are exactly the
-valid-but-wrong-key class that the proposal's mention-similarity +
-discriminator verification targets. Under the oracle name-check (ship iff
-emitted name == gold subject), precision is 96.6–100% at the same coverage —
-the gap between 95.5% and 100% is the measured value of one verification vote.
+its 209 held-out store hits is a memorized key for the WRONG referent (the 3
+"correct" shipments are coincidences where the wrong referent shares the gold
+value), so a naive splice pipeline ships silently wrong values on a third of
+all queries. The copy constraint converts that into a selective system, per
+arm [I, arithmetic on the measured counts]: within arm B, silent error falls
+**34.0% → 1.2% (~29x)** at 25.4% coverage and 95.5% precision; within arm D,
+**34.0% → 1.0% (~34x)** at 24.6% coverage and 96.0% precision. Stacking the
+name-echo vote (P0 → P1 within the same arm) removes ALL residual
+silent-wrongs — 100% precision — at ~1.1pp coverage cost (B: 154→147 shipped;
+D: 149→143). The residual P0 wrong-referent hits (7 and 6) are exactly the
+valid-but-wrong-key class the proposal's mention-similarity + discriminator
+verification targets; the P0→P1 delta is the measured value of one such vote
+at this scale.
 
 ## Reading
 
-1. **Arm A reproduces the failure signature.** Name-half 0.0 [0.0, 0.6] vs
-   2.5 [1.5, 4.1] on 07-20 (overlapping intervals; different PopQA snapshot,
-   seeds, and batch schedule); relation-half 96.0 vs 98.5. Relation transfers,
-   name-copy does not. Harness validated.
-2. **The inference-side constraint is the fix that matters at this scale:**
-   full-key 0.0% → 24.3% and end-to-end answer 2.1% → 26.2% from the SAME
-   checkpoint — the failure was emission, not knowledge, for a quarter of
-   items. The training-side fix alone moved nothing held-out (C ≈ A,
-   0.2%): at 29M/800 steps, substitution data does not teach unconstrained
-   copying. It does help WITH the constraint on seen facts (D 71.5% vs
-   B 63.0%): substitution improves span ranking where knowledge exists.
-3. **The bottleneck relocated, as designed.** With unemittable junk removed,
-   74.6% of items now fail by picking the WRONG in-context span ("The,
-   author"; "Question: Who, author") — the model cannot rank candidate spans
-   it never learned to score. This is a capability gap at 29M, not an
-   architecture gap: the 07-20 doc records the project's 160M model reaching
-   100% on held-out synthetic names, and the span-ranking signal (pointer
-   loss over spans) is exactly what the full Tier-S trains.
-4. **Go-gate verdict, honest:** the pre-registered go threshold (verified
+1. **Arm A reproduces the failure signature qualitatively** [I]: name-half
+   0.0 [0.0, 0.6] here vs 2.5 [1.5, 4.1] on 07-20; relation-half 96.0 vs
+   98.5 (different PopQA snapshot, seeds, and batch schedule — the numbers
+   are not expected to be identical). The signature — relation transfers at
+   ceiling, name-copy at chance-or-below — is unambiguous in both.
+2. **The inference-side constraint is the fix that matters at this scale**
+   [I from the measured arm contrast]: full-key 0.0% → 24.3% and end-to-end
+   answer 2.1% → 26.2% from the SAME checkpoint — for a quarter of items the
+   failure was emission, not knowledge. The training-side fix alone moved
+   nothing held-out (C: 1/606 = 0.2% vs A: 0/606): at 29M/800 steps,
+   substitution data does not teach unconstrained copying.
+3. **Seen-split interaction, directional only** [I, single seed,
+   exploratory]: with the constraint on, the substitution-trained checkpoint
+   ranks spans better where knowledge exists (D 143/200 = 71.5% vs B 126/200
+   = 63.0% seen full-key). Whether substitution "improves" ranking is
+   deferred to replication seeds 1–4.
+4. **The bottleneck relocated, as designed** [M for the rate, I for the
+   diagnosis]: with unemittable junk removed, 74.6% of items fail by picking
+   the WRONG in-context span ("The, author"; "Question: Who, author") — the
+   model cannot rank candidate spans it never learned to score. We read this
+   as a capability gap at 29M, not an architecture gap: the 07-20 doc records
+   the project's 160M model reaching 100% on held-out synthetic names, and
+   span ranking (pointer loss over spans) is exactly what the full Tier-S
+   trains.
+5. **Go-gate verdict, honest:** the pre-registered go threshold (verified
    end-to-end ≥60%, Wilson LB ≥55%) is **NOT met at 29M** — 26.2 [22.9,
-   29.9]. What IS established: the structural claim (0 → 24 full-key from
-   the same weights; silent error 33.5% → 0.83%) and the verification story
-   (95.5% → 96.6% → 100% precision as checks stack). The kill-lever does not
-   fire either (it targets Tier-C prefix accuracy, not Tier-S). Next rung per
-   the experiment ladder: 160M with the pointer-ranking loss and seeds 1–4
-   (FarmShare CPU jobs for the 29M seeds are packaged and handed off).
+   29.9]. What IS established [M counts, I framing]: the structural lift
+   (0 → 24.3 full-key from the same weights; within-arm silent error down
+   ~29–34x under P0) and the verification story (P1 removes all residual
+   silent-wrongs at ~1pp coverage cost, both constrained arms). The
+   kill-lever does not fire either (it targets Tier-C prefix accuracy, not
+   Tier-S). Next rung per the experiment ladder: 160M with the
+   pointer-ranking loss and seeds 1–4 (FarmShare CPU jobs packaged and
+   handed off).
 
 ## Caveats
 
 Single seed at toy scale (seeds 1–4 dispatched to a collaborator; directional
-until they land). Ship-on-hit precision uses answer-string match against
-PopQA possible_answers (aliases may undercount). The 2 emittability misses
-are counted as failures in all rates. Single-hop extraction traces only; the
-organizer is exact-match (no fuzzy/alias resolution). Raw numbers:
-`data/keyguess_local/summary.json`, per-item `records_{A..D}.jsonl`,
-console table in `eval.console.log`.
+until they land). Policy precision is strict normalized equality of the
+store-returned value against PopQA possible_answers — unlisted aliases may
+undercount true precision; the looser continuation-level answer metric is
+reported separately in the emitted-key table and never used for governance
+claims. The 2 emittability misses are counted as failures in all rates.
+Single-hop extraction traces only; the organizer is exact-match (no
+fuzzy/alias resolution).
+
+**Evidence (committed with this doc):** `data/keyguess_local/`
+`summary.json`, `results_{A..D}.json`, `records_{A..D}.jsonl`,
+`policy_analysis.json`, `data_manifest.json`, `emittability.json`,
+`eval.console.log`, `runs/{a,c}/log.jsonl`, `seen.jsonl`, `heldout.jsonl`,
+`eval_items.jsonl`, `organizer_real.jsonl`, plus the frozen input snapshot
+`data/realfacts/popqa_clean.jsonl` (SHA-256 pinned below). The fetch script
+pulls an UNPINNED upstream dataset that is known to drift — reproduce from
+the committed snapshot; refetch only to extend.
+
+`popqa_clean.jsonl` SHA-256: `d167a4dbed20d7bb3277a1b34f882b35655f0d8862700cc451ad0a2d85dd2fd7`
