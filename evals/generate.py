@@ -17,6 +17,12 @@ forward_step so the KV cache stays consistent; they count toward max_new.
 
 Stats semantics: n_lookups == n_hits + n_misses (queries that reached
 <|db_retrieve|>); cap-hit queries count only as n_malformed.
+
+Copy-constrained mode (query_tries, see evals/constrain.py): with a trie per
+prompt, IN_QUERY tokens are chosen by argmax over the walker's allowed ids
+only, so the emitted key must be a prompt span + relation. Forced and
+FREE-state tokens stay unconstrained; query_tries=None is the exact
+unconstrained behavior above.
 """
 
 from __future__ import annotations
@@ -84,6 +90,7 @@ def generate_batch_with_stats(
     organizer,
     device,
     stop_at_eot: bool = True,
+    query_tries: list | None = None,
 ) -> tuple[list[str], dict]:
     """Greedy-decode continuations for all prompts in one batch.
 
@@ -91,8 +98,17 @@ def generate_batch_with_stats(
     but include any forced lookup tokens. max_new counts every appended
     token, forced ones included. organizer=None means store OFF: DB_*
     tokens get no special handling.
+
+    query_tries: optional list of evals.constrain.QueryTrie (or None
+    entries), parallel to prompts. Rows with a trie decode IN_QUERY tokens
+    constrained to the trie; stats gain n_constrained_queries (queries
+    emitted under an active walker) and n_constraint_dead_ends (steps where
+    allowed() was empty and decoding fell back to unconstrained).
     """
     stats = {"n_lookups": 0, "n_hits": 0, "n_misses": 0, "n_malformed": 0}
+    if query_tries is not None:
+        stats["n_constrained_queries"] = 0
+        stats["n_constraint_dead_ends"] = 0
     if not prompts:
         return [], stats
 
@@ -116,6 +132,11 @@ def generate_batch_with_stats(
     x = torch.tensor(padded, dtype=torch.long, device=device)
 
     seqs = [_Seq() for _ in prompts]
+    walkers = (
+        [t.walker() if t is not None else None for t in query_tries]
+        if query_tries is not None
+        else [None] * len(prompts)
+    )
     with torch.no_grad():
         logits, cache = model.forward_step(x, None)
         for _ in range(steps_budget):
@@ -129,8 +150,33 @@ def generate_batch_with_stats(
                     nid = s.force.popleft()
                     forced = True
                 else:
-                    nid = int(choices[b])
                     forced = False
+                    walker = walkers[b]
+                    if (
+                        walker is not None
+                        and organizer is not None
+                        and s.state == _IN_QUERY
+                    ):
+                        allowed = walker.allowed()
+                        if allowed:
+                            gather = torch.tensor(
+                                allowed, dtype=torch.long, device=logits.device
+                            )
+                            nid = allowed[int(logits[b, -1, gather].argmax())]
+                        else:
+                            stats["n_constraint_dead_ends"] += 1
+                            nid = int(choices[b])
+                        walker.advance(nid)
+                        if nid == tok.DB_RETRIEVE:
+                            stats["n_constrained_queries"] += 1
+                    else:
+                        nid = int(choices[b])
+                        if (
+                            walker is not None
+                            and organizer is not None
+                            and nid == tok.DB_START
+                        ):
+                            walker.reset()
                     if stop_at_eot and nid == tok.EOT:
                         s.done = True
                         next_ids.append(tok.EOT)
@@ -138,6 +184,14 @@ def generate_batch_with_stats(
                 s.generated.append(nid)
                 if not forced and organizer is not None:
                     _advance_state(s, nid, tok, organizer, stats)
+                    # A model-chosen token that returns the seq to FREE ends
+                    # a query: a completed DB_RETRIEVE lookup (walker already
+                    # back at root via advance) or a QUERY_TOKEN_CAP exit
+                    # (walker left mid-trie). Resetting here is idempotent
+                    # for the retrieve path and closes the cap-exit path so
+                    # the walker never stays stale between queries.
+                    if walkers[b] is not None and s.state == _FREE:
+                        walkers[b].reset()
                 if len(s.generated) >= max_new:
                     s.done = True
                 next_ids.append(nid)
@@ -158,9 +212,17 @@ def generate_batch(
     organizer,
     device,
     stop_at_eot: bool = True,
+    query_tries: list | None = None,
 ) -> list[str]:
     """Thin wrapper over generate_batch_with_stats returning texts only."""
     texts, _ = generate_batch_with_stats(
-        model, tok, prompts, max_new, organizer, device, stop_at_eot=stop_at_eot
+        model,
+        tok,
+        prompts,
+        max_new,
+        organizer,
+        device,
+        stop_at_eot=stop_at_eot,
+        query_tries=query_tries,
     )
     return texts
