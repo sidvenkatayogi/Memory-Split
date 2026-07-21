@@ -54,14 +54,52 @@ that cost at every layer, most at the top. Weight-level counterpart of
 the bits-in-weights accounting. Caveat: small deltas at toy scale, and
 corpus token-statistics differences (lookup wrappers) could contribute.
 
-## Finding 4 (dense 160M): PENDING — battery running
+## Finding 4 (dense 160M, single-arm): storage geography and two instructive nulls
 
-Weight-spectral-vs-init, fact weight attribution (which layers store
-facts), fact-activation superposition (participation ratio), fact-unit
-ablation (recall vs deduction dissociation), and per-layer attention-band
-ablation are running on CPU at the time of writing (Apple-GPU backend
-lacks the SVD op and silently killed two attempts; CPU is reliable).
-This section is updated when the run lands.
+Full battery completed 2026-07-21 15:15 (CPU, ~10 min). Context for all
+four: this checkpoint memorized almost nothing (0.7% closed-book recall
+at the gate budget), so it probes the *undertrained* end of the storage
+story.
+
+**4a. Training compresses; the top layer most.** Effective rank of every
+MLP down-projection fell 43-63 below its random-init value (largest drop:
+final layer, -63). Fact-heavy training should RESIST this compression
+(arbitrary mappings are incompressible) — the dense-vs-split rank gap at
+matched steps, per dose, is the quantity to watch on the sweep pairs.
+
+**4b. Fact attribution is U-shaped.** Gradient-times-weight attribution
+of fact-recall NLL concentrates at the network's two ends: layer 0
+(12.3%) and layers 9-11 (11-13% each), with a valley through layers 2-4.
+The few facts this model does hold live embedding-adjacent and
+readout-adjacent, not in the mid-layer MLPs the LLM knowledge-editing
+literature emphasizes — plausibly a signature of the undertrained regime.
+
+**4c. Fact contexts collapse to ~2 effective dimensions.** Participation
+ratio of final-layer residuals: 2.3 for fact prompts vs 8.4 for reasoning
+prompts (of 768). Fact prompts produce near-identical internal states:
+the model treats "X's major is" generically instead of per-entity — the
+activation-level face of "facts not stored" and the baseline point for
+the superposition-vs-dose curve (prediction: PR rises as dense actually
+memorizes, then compresses under crowding).
+
+**4d. Ablation dissociation — an instructive floor-effect null.**
+Ablating the top-60 fact-selective units left recall NLL essentially
+unchanged (+0.003 nats) while *deduction* NLL worsened by 0.80 nats. No
+recall damage is expected when there is no recall to damage (floor
+effect); the deduction damage says those "fact-selective" units carry
+load-bearing general computation at this stage. The dissociation test
+needs a dense checkpoint that actually memorized — i.e. the full-budget
+sweep arms.
+
+**4e. Methodological catch (attention probe):** per-layer attention-band
+ablation *improved* teacher-forced NLL on yes/no deduction answers
+(layer 0 by a implausible 8.6 nats). This is a scorer artifact, not a
+discovery: breaking the model collapses it toward generic high-frequency
+tokens, which can lower NLL on short binary answers. The attention probe
+needs a margin-based scorer (yes-vs-no logit difference) before its
+numbers mean anything; flagged for the cluster runs.
+
+Raw numbers for all five: `outputs/probe-local/probe_local_results.json`.
 
 ## What the full-scale versions will test (on the rebuilt sweep pairs)
 
