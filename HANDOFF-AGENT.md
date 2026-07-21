@@ -233,7 +233,58 @@ confirmation wall (4 single-GPU runs fit in one account's 4 slots
 already); shortening that requires multi-GPU training or paid compute,
 which is an escalation to Stephen, not an agent decision.
 
-## 10. Integrity constraints (non-negotiable)
+## 10. AWS / bare-metal mode (for the 1B confirmation on 8xH100)
+
+The confirmation tier runs dramatically faster on H100s (~1.5 days for
+all four runs vs ~6 on FarmShare) and keeps both seed pairs on one
+platform, which the preregistration prefers. There is no Slurm on the
+box; use the bundled launcher.
+
+```bash
+# on the AWS node (Ubuntu + CUDA assumed), from the unzipped repo:
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+export PATH=$PWD/.venv/bin:$PATH
+PYTHONPATH=$PWD python -m pytest tests -q          # expect 124 passed
+PYTHONPATH=$PWD python scripts/smoke_test.py --device cuda   # expect SMOKE PASS
+
+# corpus: rebuild the calib-winning 1B load locally (deterministic).
+# ~2h on a box this size; verify report.json checks are all true and, if
+# a FarmShare copy exists, that bed_hash_digest matches it exactly.
+PYTHONPATH=$PWD python scripts/build_corpus.py --out-root data_root \
+    --stage full1b --loads <n800k|n4m> --workers 16
+
+# configs + launch (4 runs pinned to GPUs 0-3, auto-resume, idempotent):
+PYTHONPATH=$PWD python scripts/make_manifest.py --stage confirm \
+    --top-load <winner> --data-root $PWD/data_root
+PYTHONPATH=$PWD nohup python scripts/run_local_gpus.py \
+    --manifest outputs/manifests/confirm.tsv --gpus 0,1,2,3 > launcher.out 2>&1 &
+
+# optional 410M add-back tier on the spare GPUs (preregistered optional;
+# needs the 160M sweep corpora too — rebuild with --stage full first):
+PYTHONPATH=$PWD python scripts/make_manifest.py --stage mid410 \
+    --top-load <winner> --data-root $PWD/data_root
+PYTHONPATH=$PWD nohup python scripts/run_local_gpus.py \
+    --manifest outputs/manifests/mid410.tsv --gpus 4,5,6,7 > launcher410.out 2>&1 &
+```
+
+Evals on the same box once runs finish (no sbatch; direct):
+
+```bash
+for run in outputs/d1b_*; do
+  PYTHONPATH=$PWD python scripts/run_evals.py --run "$run" --limit 1500
+done
+```
+
+Notes: if the instance is spot/preemptible, the launcher plus checkpoint
+resume already handles interruption (rerun the same launcher command).
+Keep the machine's clock and disk in mind: each 1B run writes ~20-40 GB
+of checkpoints/snapshots; prune snapshots after evals as in section 7.
+Mixed-platform caveat: sweep pairs (FarmShare L40S) and confirmation
+pairs (H100) sit on different hardware, which the preregistration
+permits (pairs are platform-atomic; cross-TIER hardware may differ) but
+report it in the final writeup.
+
+## 11. Integrity constraints (non-negotiable)
 
 - No endpoint, margin, seed, mixture, difficulty, or exclusion-rule
   changes. The preregistration is frozen; violations void the experiment.
