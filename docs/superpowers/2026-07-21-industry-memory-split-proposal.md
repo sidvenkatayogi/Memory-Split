@@ -571,4 +571,3 @@ and the governance/product claims stand under an H1 null.
 - Optimal sparsity: arXiv 2508.18672 — active-FLOPs / TPP decomposition [M]
 - MPHF/ribbon, RaBitQ, LSM, TIGER (2305.05065), OneRec (2506.13695), DSI, ReFactX (2508.16983), KARLA (2606.26807), Knowledge Objects (2603.17781), SLUNG/SPLM, MeKi, Memory³, MaskMoE (2407.09816), OLMoE (2409.02060), RAGCache/CacheBlend (serving corrections) — as discussed in the design sections [M/I as marked].
 - Internal: docs/superpowers/2026-07-20-interim-report.md; /2026-07-20-heldout-key-generalization-results.md (the failure this proposal fixes); data/keyguess_local/ (the fix measurement, this repo).
-
