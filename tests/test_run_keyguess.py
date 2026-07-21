@@ -14,6 +14,8 @@ import pytest
 from corpusgen import bios, realfact
 from corpusgen.records import QAItem
 from scripts.run_keyguess_local import (
+    TRAINER_BASE_SEED,
+    _trainer_cfg,
     accumulate_stats,
     arm_plan,
     assemble_corpus,
@@ -23,6 +25,7 @@ from scripts.run_keyguess_local import (
     load_eval_items,
     relation_counts,
     require_corpus_complete,
+    seed_suffix,
     write_eval_items,
 )
 from train.tokenizer import get_tok
@@ -265,6 +268,45 @@ def test_require_corpus_complete_raises_on_missing_mask(tmp_path):
     (d / "train.bin").write_bytes(b"\x00" * 100)
     with pytest.raises(SystemExit):
         require_corpus_complete(d, stage="train")
+
+
+# ------------------------------------------------ replication seed bundles
+
+
+def test_seed_suffix_zero_is_original_paths():
+    assert seed_suffix(0) == ""
+    assert seed_suffix(3) == "_s3"
+    with pytest.raises(ValueError):
+        seed_suffix(-1)
+
+
+def test_trainer_cfg_seed_bundle_offsets_trainer_seed(tmp_path):
+    cfg0 = _trainer_cfg("a", tmp_path, tmp_path / "out", 800, "cpu", seed=0)
+    cfg2 = _trainer_cfg("a", tmp_path, tmp_path / "out2", 800, "cpu", seed=2)
+    assert cfg0["seed"] == TRAINER_BASE_SEED
+    assert cfg0["run_id"] == "keyguess_a"
+    assert cfg2["seed"] == TRAINER_BASE_SEED + 2
+    assert cfg2["run_id"] == "keyguess_a_s2"
+    # everything else identical except out_dir
+    for key in ("model", "micro_batch_size", "tokens_per_step", "lr",
+                "warmup_steps", "max_steps"):
+        assert cfg0[key] == cfg2[key]
+
+
+def test_assemble_corpus_shuffle_seed_changes_stream(tmp_path):
+    facts = _facts()
+    records = _records()
+    kwargs = dict(n_exposures=1, seed=0, substitution_frac=0.0, fresh_flood=0,
+                  n_factqa_docs=0, factqa_seed=7)
+    rep0 = assemble_corpus(facts, records, TOK, tmp_path / "s0",
+                           shuffle_seed=123, **kwargs)
+    rep1 = assemble_corpus(facts, records, TOK, tmp_path / "s1",
+                           shuffle_seed=124, **kwargs)
+    # same content, different order: token counts equal, bytes differ
+    assert rep0["n_tokens"] == rep1["n_tokens"]
+    ids0 = np.fromfile(tmp_path / "s0" / "train.bin", dtype=np.uint16)
+    ids1 = np.fromfile(tmp_path / "s1" / "train.bin", dtype=np.uint16)
+    assert not np.array_equal(ids0, ids1)
 
 
 # ----------------------------------------- FIX 3: stats aggregation

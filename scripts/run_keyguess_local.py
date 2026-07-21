@@ -48,8 +48,25 @@ EVAL_BATCH_SIZE = 32
 EVAL_MAX_NEW = 64
 EMITTABILITY_FLOOR = 0.99
 
+# Protocol base seeds (seed bundle 0 == the 2026-07-21 local run exactly).
+TRAINER_BASE_SEED = 7
+SHUFFLE_BASE_SEED = 123
+RENDER_BASE_SEED = 0
+
 
 # --------------------------------------------------------------- pure helpers
+
+
+def seed_suffix(seed: int) -> str:
+    """Artifact suffix for a replication seed bundle. Seed 0 keeps the
+    original unsuffixed paths so the first local run stays valid; seed S>0
+    gets corpus_a_s{S}, runs/a_s{S}, results_A_s{S}.json, summary_s{S}.json.
+    The PopQA split and eval items are seed-independent (shared): replication
+    varies model init, doc order, and substitution/flood draws — never the
+    held-out set."""
+    if seed < 0:
+        raise ValueError(f"seed must be >= 0, got {seed}")
+    return "" if seed == 0 else f"_s{seed}"
 
 
 def arm_plan(arms: list[str]) -> list[dict]:
@@ -262,8 +279,14 @@ def require_corpus_complete(corpus_dir: Path, *, stage: str) -> None:
 # -------------------------------------------------------------------- stages
 
 
-def stage_data(force: bool = False) -> None:
-    """Idempotent data stage: split, corpora, organizer, eval items, gate."""
+def stage_data(force: bool = False, seed: int = 0) -> None:
+    """Idempotent data stage: split, corpora, organizer, eval items, gate.
+
+    Shared artifacts (split/organizer/eval items/emittability/manifest) are
+    seed-independent and built once; the corpora are per-seed-bundle (doc
+    shuffle + substitution/flood draws vary), suffixed via seed_suffix.
+    """
+    sfx = seed_suffix(seed)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not REALFACTS_PATH.exists():
         raise SystemExit(
@@ -275,14 +298,15 @@ def stage_data(force: bool = False) -> None:
     org_path = DATA_DIR / "organizer_real.jsonl"
     eval_path = DATA_DIR / "eval_items.jsonl"
     emit_path = DATA_DIR / "emittability.json"
-    corpus_a = DATA_DIR / "corpus_a"
-    corpus_c = DATA_DIR / "corpus_c"
+    corpus_a = DATA_DIR / f"corpus_a{sfx}"
+    corpus_c = DATA_DIR / f"corpus_c{sfx}"
 
-    if (not force and seen_path.exists() and held_path.exists()
-            and org_path.exists() and eval_path.exists() and emit_path.exists()
-            and corpus_complete(corpus_a)
+    shared_ok = (seen_path.exists() and held_path.exists() and org_path.exists()
+                 and eval_path.exists() and emit_path.exists())
+    if (not force and shared_ok and corpus_complete(corpus_a)
             and corpus_complete(corpus_c)):
-        print("[data] all outputs present; skipping (use --force to rebuild)")
+        print(f"[data] all outputs present for seed {seed}; skipping "
+              "(use --force to rebuild)")
         return
 
     facts = realfact.load_realfacts(REALFACTS_PATH)
@@ -314,19 +338,21 @@ def stage_data(force: bool = False) -> None:
     tok = get_tok()
     records = bios.generate_records(n_entities=300, seed=7)
 
+    render_seed = RENDER_BASE_SEED + seed
+    shuffle_seed = SHUFFLE_BASE_SEED + seed
     rep_a = assemble_corpus(
         seen, records, tok, corpus_a,
-        n_exposures=6, seed=0, substitution_frac=0.0, fresh_flood=0,
-        n_factqa_docs=900, factqa_seed=7,
+        n_exposures=6, seed=render_seed, substitution_frac=0.0, fresh_flood=0,
+        n_factqa_docs=900, factqa_seed=7, shuffle_seed=shuffle_seed,
     )
-    print(f"[data] corpus_a: {rep_a['n_docs']} docs, "
+    print(f"[data] {corpus_a.name}: {rep_a['n_docs']} docs, "
           f"{rep_a['n_tokens']} tokens, masked {rep_a['masked_token_frac']:.3f}")
     rep_c = assemble_corpus(
         seen, records, tok, corpus_c,
-        n_exposures=6, seed=0, substitution_frac=0.5, fresh_flood=2400,
-        n_factqa_docs=900, factqa_seed=7,
+        n_exposures=6, seed=render_seed, substitution_frac=0.5, fresh_flood=2400,
+        n_factqa_docs=900, factqa_seed=7, shuffle_seed=shuffle_seed,
     )
-    print(f"[data] corpus_c: {rep_c['n_docs']} docs, "
+    print(f"[data] {corpus_c.name}: {rep_c['n_docs']} docs, "
           f"{rep_c['n_tokens']} tokens, masked {rep_c['masked_token_frac']:.3f}")
 
     realfact.build_real_organizer(seen + heldout).save(org_path)
@@ -373,9 +399,9 @@ def stage_data(force: bool = False) -> None:
 
 
 def _trainer_cfg(run: str, corpus_dir: Path, out_dir: Path, steps: int,
-                 device: str) -> dict:
+                 device: str, seed: int = 0) -> dict:
     return {
-        "run_id": f"keyguess_{run}",
+        "run_id": f"keyguess_{run}{seed_suffix(seed)}",
         "arm": "split",
         "model": {"n_layer": 4, "n_head": 4, "d_model": 256, "ctx": 192,
                   "vocab_size": 50304},
@@ -386,7 +412,7 @@ def _trainer_cfg(run: str, corpus_dir: Path, out_dir: Path, steps: int,
         "max_steps": steps,
         "lr": 1.5e-3,
         "warmup_steps": 40,
-        "seed": 7,
+        "seed": TRAINER_BASE_SEED + seed,
         "device": device,
         "out_dir": str(out_dir),
         "log_every": 25,
@@ -396,21 +422,22 @@ def _trainer_cfg(run: str, corpus_dir: Path, out_dir: Path, steps: int,
     }
 
 
-def stage_train(arms: list[str], steps: int, device: str) -> None:
+def stage_train(arms: list[str], steps: int, device: str, seed: int = 0) -> None:
     """Train one model per requested corpus (a and/or c); resume from ckpt."""
+    sfx = seed_suffix(seed)
     plan = arm_plan(arms)
     needed_runs = sorted({p["run"] for p in plan})
     for run in needed_runs:
-        corpus_dir = DATA_DIR / f"corpus_{run}"
+        corpus_dir = DATA_DIR / f"corpus_{run}{sfx}"
         require_corpus_complete(corpus_dir, stage="train")
-        out_dir = DATA_DIR / "runs" / run
-        cfg = _trainer_cfg(run, corpus_dir, out_dir, steps, device)
+        out_dir = DATA_DIR / "runs" / f"{run}{sfx}"
+        cfg = _trainer_cfg(run, corpus_dir, out_dir, steps, device, seed)
         trainer = Trainer(cfg)
         if trainer.ckpt_path.exists():
             trainer.load_ckpt()
-            print(f"[train] {run}: resumed from step {trainer.step}")
+            print(f"[train] {run}{sfx}: resumed from step {trainer.step}")
         trainer.train_steps()
-        print(f"[train] {run}: done at step {trainer.step}")
+        print(f"[train] {run}{sfx}: done at step {trainer.step}")
 
 
 def _load_model(run_dir: Path, device: str) -> GPT:
@@ -442,8 +469,9 @@ def accumulate_stats(acc: dict[str, int],
     return acc
 
 
-def stage_eval(arms: list[str], device: str, limit: int) -> None:
+def stage_eval(arms: list[str], device: str, limit: int, seed: int = 0) -> None:
     """Generate + score every requested arm; write per-arm + summary JSONs."""
+    sfx = seed_suffix(seed)
     tok = get_tok()
     org = Organizer.load(DATA_DIR / "organizer_real.jsonl")
     items = load_eval_items(DATA_DIR / "eval_items.jsonl")
@@ -458,7 +486,7 @@ def stage_eval(arms: list[str], device: str, limit: int) -> None:
         arm = entry["arm"]
         run = entry["run"]
         constrained = entry["constrained"]
-        run_dir = DATA_DIR / "runs" / run
+        run_dir = DATA_DIR / "runs" / f"{run}{sfx}"
         if not (run_dir / "ckpt.pt").exists():
             print(f"[eval] {arm}: no ckpt at {run_dir / 'ckpt.pt'}; skipping")
             continue
@@ -482,16 +510,17 @@ def stage_eval(arms: list[str], device: str, limit: int) -> None:
         out = {
             "arm": arm,
             "constrained": constrained,
-            "run": run,
+            "run": f"{run}{sfx}",
+            "seed": seed,
             "n_items": len(items),
             "aggregates": scored,
             "generation_stats": gen_stats,
             "config": {"max_new": EVAL_MAX_NEW, "batch_size": EVAL_BATCH_SIZE,
                        "limit": limit, "device": device},
         }
-        with open(DATA_DIR / f"results_{arm}.json", "w") as f:
+        with open(DATA_DIR / f"results_{arm}{sfx}.json", "w") as f:
             json.dump(out, f, indent=2)
-        with open(DATA_DIR / f"records_{arm}.jsonl", "w") as f:
+        with open(DATA_DIR / f"records_{arm}{sfx}.jsonl", "w") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
         results[arm] = out
@@ -502,7 +531,7 @@ def stage_eval(arms: list[str], device: str, limit: int) -> None:
               f"relation_half={held.get('relation_half', 0):.3f} "
               f"answer={held.get('answer', 0):.3f}")
 
-    with open(DATA_DIR / "summary.json", "w") as f:
+    with open(DATA_DIR / f"summary{sfx}.json", "w") as f:
         json.dump(results, f, indent=2)
     _print_table(results)
 
@@ -546,6 +575,11 @@ def main() -> None:
                     help="rebuild the data stage even if outputs exist")
     ap.add_argument("--limit", type=int, default=0,
                     help="cap eval items (0 = all; for smoke)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="replication seed bundle (0 = the original run; "
+                         "S>0 varies trainer init, doc order, and "
+                         "substitution/flood draws; the PopQA split and "
+                         "eval items never vary)")
     args = ap.parse_args()
 
     arms = [a.strip().upper() for a in args.arms.split(",") if a.strip()]
@@ -553,18 +587,18 @@ def main() -> None:
         if a not in ARMS_DEFAULT:
             raise SystemExit(f"unknown arm {a!r}; expected A,B,C,D")
     device = pick_device(args.device)
-    print(f"device: {device}")
+    print(f"device: {device} seed: {args.seed}")
 
     if args.stage == "data":
-        stage_data(force=args.force)
+        stage_data(force=args.force, seed=args.seed)
     elif args.stage == "train":
-        stage_train(arms, args.steps, device)
+        stage_train(arms, args.steps, device, seed=args.seed)
     elif args.stage == "eval":
-        stage_eval(arms, device, args.limit)
+        stage_eval(arms, device, args.limit, seed=args.seed)
     else:  # all
-        stage_data(force=args.force)
-        stage_train(["A", "C"], args.steps, device)
-        stage_eval(arms, device, args.limit)
+        stage_data(force=args.force, seed=args.seed)
+        stage_train(["A", "C"], args.steps, device, seed=args.seed)
+        stage_eval(arms, device, args.limit, seed=args.seed)
 
 
 if __name__ == "__main__":
