@@ -185,7 +185,55 @@ confirmation ~90-220 GB depending on snapshots. Manage it:
 - **Other-user queue contention is normal**: sweep runs at 4-GPU QOS cap;
   pending with reason Priority just means wait.
 
-## 9. Integrity constraints (non-negotiable)
+## 9. Two-collaborator mode (optional, recommended if two accounts exist)
+
+The battery splits across two accounts, A and B. Rules first: a seed pair
+(dense + split, same load, same seed) is ATOMIC and runs entirely inside
+one account; both accounts run the same zip and the same setup_env (same
+torch wheels); results merge at analysis time by run name.
+
+Assignment:
+
+- **Account A (corpus host).** Runs `bash cluster/run_battery.sh` as
+  written EXCEPT edit the sweep loop to skip seed-1 configs (or simply
+  scancel the six `*_s1` jobs it submits). Hosts all corpora; runs both
+  calib1b runs; runs the three seed-0 sweep pairs; later runs the
+  confirmation seed-0 pair (`run_confirm.sh` submits both pairs; scancel
+  the `*_s1` chains, account B submits those).
+- **Account B.** Does NOT build corpora. After A's builds finish (every
+  report.json check true), set the data root to A's scratch and submit
+  only seed-1 configs:
+
+```bash
+# in B's repo clone, after A's corpora exist:
+DATA_A=/scratch/users/<accountA>/memorysplit_data
+PYTHONPATH=$PWD $VENV/bin/python scripts/make_manifest.py --stage sweep --data-root $DATA_A
+grep _s1 outputs/manifests/sweep.tsv > outputs/manifests/sweep_b.tsv
+while read cfg; do sbatch --exclude=wheat-01 --export=ALL,CONFIG="$cfg" \
+    cluster/slurm/train_single.sbatch; done < outputs/manifests/sweep_b.tsv
+# confirmation, after the calib rule (top load decided in A):
+PYTHONPATH=$PWD $VENV/bin/python scripts/make_manifest.py --stage confirm --top-load <winner> --data-root $DATA_A
+grep _s1 outputs/manifests/confirm.tsv | while read cfg; do bash cluster/submit_chain.sh "$cfg" 4; done
+```
+
+  Verify read access first (`head -c 100 $DATA_A/n50k/dense/train.bin`);
+  if scratch permissions block cross-account reads, B rebuilds its needed
+  loads with `data_prep.sbatch` and MUST verify byte-identity against A
+  before training: every value and digest in B's report.json must equal
+  A's (deterministic builds make this exact, not approximate).
+- **Account A must not delete corpora until B's runs are all finished.**
+- Both accounts run `run_evals_pending.sh` for their own runs. Handback:
+  B rsyncs its `outputs/` into A's tree (run names are globally unique),
+  then A runs the analysis step from section 6 over the merged tree.
+
+What this buys: the sweep+calib phase compresses to under a day, storage
+splits across accounts, and each account carries one whole confirmation
+pair (halving blast radius). It does NOT shorten the ~6-day 1B
+confirmation wall (4 single-GPU runs fit in one account's 4 slots
+already); shortening that requires multi-GPU training or paid compute,
+which is an escalation to Stephen, not an agent decision.
+
+## 10. Integrity constraints (non-negotiable)
 
 - No endpoint, margin, seed, mixture, difficulty, or exclusion-rule
   changes. The preregistration is frozen; violations void the experiment.
