@@ -254,7 +254,15 @@ PYTHONPATH=$PWD nohup python scripts/run_local_gpus.py \
 PYTHONPATH=$PWD python scripts/make_manifest.py --stage mid410 \
     --top-load <winner> --data-root $PWD/data_root
 PYTHONPATH=$PWD nohup python scripts/run_local_gpus.py \
-    --manifest outputs/manifests/mid410.tsv --gpus 4,5,6,7 > launcher410.out 2>&1 &
+    --manifest outputs/manifests/mid410.tsv --gpus 4,5 > launcher410.out 2>&1 &
+
+# exploratory overtraining pair (~8 h/arm on H100; outside the frozen
+# preregistration, spare capacity only — see
+# docs/superpowers/specs/2026-07-21-overtrain-exploratory.md):
+PYTHONPATH=$PWD python scripts/build_corpus.py --out-root $PWD/data_root --stage over --workers 16
+PYTHONPATH=$PWD python scripts/make_manifest.py --stage overtrain --data-root $PWD/data_root
+PYTHONPATH=$PWD nohup python scripts/run_local_gpus.py \
+    --manifest outputs/manifests/overtrain.tsv --gpus 6,7 > launcher_over.out 2>&1 &
 ```
 
 Evals on the same box once runs finish (no sbatch; direct):

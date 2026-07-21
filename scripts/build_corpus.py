@@ -26,15 +26,22 @@ from pathlib import Path
 from corpusgen.build import LOADS, BuildCfg, build_corpus
 from train.tokenizer import get_tok
 
-STAGE_TOKENS = {"gates": 800_000_000, "full": 3_200_000_000, "full1b": 10_000_000_000}
+STAGE_TOKENS = {
+    "gates": 800_000_000,
+    "full": 3_200_000_000,
+    "full1b": 10_000_000_000,
+    # exploratory overtraining tier: 80 tokens/param at 160M (4x Chinchilla)
+    "over": 12_800_000_000,
+}
 STAGE_DEFAULT_LOADS = {
     "gates": "n50k,n200k,n800k",
     "full": "n50k,n200k,n800k",
     "full1b": "n800k,n4m",
+    "over": "n200k",
 }
 # each stage owns its directories — gates and full builds may run
 # concurrently and must never share output paths (learned the hard way)
-STAGE_DIR_TAG = {"gates": "_gate", "full": "", "full1b": "_1b"}
+STAGE_DIR_TAG = {"gates": "_gate", "full": "", "full1b": "_1b", "over": "_over"}
 
 
 def bed_iter_hf():

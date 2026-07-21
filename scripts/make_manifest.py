@@ -38,11 +38,13 @@ GATE_TOKENS = 800_000_000  # short-budget pilots for gates A-C
 
 
 def make_cfg(preset, arm, load, seed, data_root, out_root, total_tokens=None,
-             data_tag=""):
+             data_tag="", run_tag=None, snap_frac=0.10):
     tokens, tps, mbs, lr, warmup = SCALE[preset]
     if total_tokens is not None:
         tokens = total_tokens
-    run_id = f"{preset}_{arm}_{load}_s{seed}" + ("" if total_tokens is None else "_gate")
+    if run_tag is None:
+        run_tag = "" if total_tokens is None else "_gate"
+    run_id = f"{preset}_{arm}_{load}_s{seed}" + run_tag
     data_dir = Path(data_root) / (load + data_tag)
     return run_id, {
         "run_id": run_id,
@@ -65,7 +67,7 @@ def make_cfg(preset, arm, load, seed, data_root, out_root, total_tokens=None,
         "out_dir": str(Path(out_root) / run_id),
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.10,
+        "snap_frac": snap_frac,
         "ckpt_minutes": 30,
     }
 
@@ -73,7 +75,8 @@ def make_cfg(preset, arm, load, seed, data_root, out_root, total_tokens=None,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", required=True,
-                    choices=["gates", "sweep", "calib1b", "confirm", "mid410"])
+                    choices=["gates", "sweep", "calib1b", "confirm", "mid410",
+                             "overtrain"])
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--out-root", default="outputs")
     ap.add_argument("--top-load", default="n800k", choices=list(LOADS))
@@ -111,6 +114,17 @@ def main() -> None:
         for arm in ("dense", "split"):
             for seed in (0, 1, 2):
                 jobs.append(make_cfg("d410m", arm, args.top_load, seed, args.data_root, args.out_root))
+    elif args.stage == "overtrain":
+        # EXPLORATORY tier (outside the frozen preregistration): one 160M
+        # pair at 80 tokens/param (12.8B tokens, 4x Chinchilla) on the
+        # n200k dose, dense snapshots (every 5%) so per-checkpoint evals
+        # trace recall / bits-in-weights / fact-use through the
+        # overtraining trajectory. See specs/2026-07-21-overtrain-exploratory.md.
+        for arm in ("dense", "split"):
+            jobs.append(make_cfg("d160m", arm, "n200k", 0, args.data_root,
+                                 args.out_root, total_tokens=12_800_000_000,
+                                 data_tag="_over", run_tag="_over",
+                                 snap_frac=0.05))
 
     gen_dir = Path("configs/gen")
     gen_dir.mkdir(parents=True, exist_ok=True)
