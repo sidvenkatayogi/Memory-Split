@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from itertools import islice
 
 import pytest
 
@@ -71,32 +72,38 @@ def test_world_generation_is_seed_deterministic():
     )
 
 
-def test_world_stream_uses_global_offsets_and_handles_partial_world():
-    worlds = list(
-        iter_worlds(
-            n_entities=10,
-            world_size=4,
-            seed=13,
-            world_id_offset=3,
-        )
+def test_public_world_ids_have_disjoint_addresses():
+    first = generate_world(3, WorldConfig(n_entities=32, seed=7))
+    second = generate_world(4, WorldConfig(n_entities=32, seed=7))
+    store = AtomicGraphStore(
+        [fact.row for fact in first.facts]
+        + [fact.row for fact in second.facts]
     )
-    assert [world.world_id for world in worlds] == [3, 4, 5]
-    assert [len(world.entity_names) for world in worlds] == [4, 4, 2]
-    assert [
-        sorted({fact.row.source_id for fact in world.facts}) for world in worlds
-    ] == [list(range(12, 16)), list(range(16, 20)), list(range(20, 22))]
+    assert len(store) == 2 * 32 * 6
 
-    all_facts = [fact for world in worlds for fact in world.facts]
-    assert len({fact.fact_id for fact in all_facts}) == len(all_facts)
-    assert len({fact.row.address for fact in all_facts}) == len(all_facts)
-    for world in worlds:
-        sources = {fact.row.source_id for fact in world.facts}
-        targets = {
-            int(fact.row.target)
-            for fact in world.facts
-            if fact.row.target_kind == "entity"
-        }
-        assert targets <= sources
+
+@pytest.mark.parametrize(
+    ("n_entities", "expected"),
+    [
+        (65, [49, 16]),
+        (70, [54, 16]),
+        (127, [63, 64]),
+    ],
+)
+def test_world_stream_never_emits_undersized_tail(n_entities, expected):
+    worlds = list(iter_worlds(n_entities, world_size=64, seed=11))
+    assert [len(world.entity_names) for world in worlds] == expected
+    assert sum(len(world.entity_names) for world in worlds) == n_entities
+    assert all(len(world.entity_names) >= 16 for world in worlds)
+
+
+def test_world_stream_rejects_totals_below_reasoning_minimum_immediately():
+    with pytest.raises(ValueError, match="n_entities must be at least 16"):
+        iter_worlds(
+            n_entities=15,
+            world_size=64,
+            seed=23,
+        )
 
 
 def test_world_iterator_does_not_materialize_the_requested_population():
@@ -256,6 +263,93 @@ def test_reasoning_records_have_fixed_hops_and_six_supervised_steps(hop_band):
         segment.text for segment in record.segments if segment.role == "final_answer"
     )
     assert final_answer not in {fact.row.target for fact in world.facts}
+
+
+def test_reasoning_records_cover_every_task_with_post_halt_noops_and_controls():
+    tok = get_tok()
+    world = generate_world(0, WorldConfig(n_entities=64, seed=43))
+    facts_by_id = {fact.fact_id: fact for fact in world.facts}
+    records = list(
+        islice(
+            iter_reasoning_records(
+                tok,
+                lambda: iter((world,)),
+                seed=47,
+                max_hops=2,
+            ),
+            24,
+        )
+    )
+    records_by_task = {
+        task: next(
+            record
+            for record in records
+            if f"-{task}-" in record.schedule.record_id
+        )
+        for task in (
+            "path_composition",
+            "date_ordering",
+            "balanced_equality",
+        )
+    }
+
+    for record in records_by_task.values():
+        ids, _, _ = tok.encode_tagged_segments(record.segments)
+        action_frames = []
+        for segment in record.segments:
+            if segment.role != "action":
+                continue
+            segment_ids = tok.encode(segment.text)
+            if segment_ids and segment_ids[0] == tok.GRAPH_START:
+                action_frames.append(segment_ids)
+
+        assert len(action_frames) == 6
+        assert [frame[4] for frame in action_frames] == [
+            tok.GRAPH_READ,
+            tok.GRAPH_READ,
+            tok.GRAPH_HALT,
+            tok.GRAPH_NOOP,
+            tok.GRAPH_NOOP,
+            tok.GRAPH_NOOP,
+        ]
+        assert ids.count(tok.ANSWER_STATE) == 6
+        assert ids.count(tok.GRAPH_MISS) == 4
+        assert (
+            sum(
+                segment.role == "provisional_answer"
+                for segment in record.segments
+            )
+            == 6
+        )
+        assert (
+            sum(
+                segment.role == "final_answer"
+                for segment in record.segments
+            )
+            == 1
+        )
+
+        payload_indexes = [
+            index
+            for index, segment in enumerate(record.segments)
+            if segment.role == "payload"
+        ]
+        assert len(payload_indexes) == 2
+        for index in payload_indexes:
+            payload = record.segments[index]
+            fact = facts_by_id[payload.fact_id]
+            expected_payload = next(
+                segment
+                for segment in serialize_return(fact.row, fact.fact_id)
+                if segment.role == "payload"
+            )
+            assert payload.text == expected_payload.text
+            assert record.segments[index + 1].text == "<|graph_end|>"
+            neutral = record.segments[index + 2]
+            assert neutral.role == "plain"
+            assert len(tok.encode(neutral.text)) == len(
+                tok.encode(payload.text)
+            )
 
 
 def test_reasoning_renderer_rejects_non_curriculum_hop_bands():

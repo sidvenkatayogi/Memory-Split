@@ -24,6 +24,8 @@ ENTITY_RELATIONS = tuple(f"r{index}" for index in range(4))
 DATE_RELATION = "r4"
 CATEGORY_RELATION = "r5"
 CURRICULUM_HOPS = (1, 2, 4)
+MIN_REASONING_ENTITIES = 16
+_DEFAULT_WORLD_ENTITY_STRIDE = 1 << 64
 
 
 @dataclass(frozen=True)
@@ -31,15 +33,20 @@ class WorldConfig:
     n_entities: int = 64
     seed: int = 0
     relation_count: int = 4
-    entity_id_offset: int = 0
+    entity_id_offset: int | None = None
 
     def __post_init__(self) -> None:
         if self.n_entities <= 0:
             raise ValueError("n_entities must be positive")
         if self.relation_count != len(ENTITY_RELATIONS):
             raise ValueError("relation_count must be 4")
-        if self.entity_id_offset < 0:
+        if self.entity_id_offset is not None and self.entity_id_offset < 0:
             raise ValueError("entity_id_offset must be non-negative")
+        if (
+            self.entity_id_offset is None
+            and self.n_entities > _DEFAULT_WORLD_ENTITY_STRIDE
+        ):
+            raise ValueError("default-offset worlds exceed the entity stride")
 
 
 @dataclass(frozen=True)
@@ -103,9 +110,14 @@ def generate_world(world_id: int, cfg: WorldConfig) -> GraphWorld:
     if world_id < 0:
         raise ValueError("world_id must be non-negative")
 
+    entity_id_offset = (
+        world_id * _DEFAULT_WORLD_ENTITY_STRIDE
+        if cfg.entity_id_offset is None
+        else cfg.entity_id_offset
+    )
     rng = random.Random((cfg.seed << 32) ^ world_id)
     names = tuple(
-        f"entity-{cfg.entity_id_offset + local_id}-{rng.getrandbits(32):08x}"
+        f"entity-{entity_id_offset + local_id}-{rng.getrandbits(32):08x}"
         for local_id in range(cfg.n_entities)
     )
     facts: list[GraphFact] = []
@@ -114,8 +126,8 @@ def generate_world(world_id: int, cfg: WorldConfig) -> GraphWorld:
         targets = list(range(cfg.n_entities))
         rng.shuffle(targets)
         for source_id, target_id in enumerate(targets):
-            global_source = cfg.entity_id_offset + source_id
-            global_target = cfg.entity_id_offset + target_id
+            global_source = entity_id_offset + source_id
+            global_target = entity_id_offset + target_id
             compose = rng.randrange(4)
             row = GraphRow(
                 source_id=global_source,
@@ -152,7 +164,7 @@ def generate_world(world_id: int, cfg: WorldConfig) -> GraphWorld:
         dates[-1] = "2099-12-31"
     categories = _category_values(rng, cfg.n_entities)
     for source_id, (date, category) in enumerate(zip(dates, categories)):
-        global_source = cfg.entity_id_offset + source_id
+        global_source = entity_id_offset + source_id
         for relation_index, relation_id, value, entropy in (
             (4, DATE_RELATION, date, 14.7),
             (5, CATEGORY_RELATION, category, 6.0),
@@ -186,30 +198,64 @@ def generate_world(world_id: int, cfg: WorldConfig) -> GraphWorld:
     )
 
 
+def _iter_world_sizes(
+    n_entities: int,
+    world_size: int,
+) -> Iterator[int]:
+    full_worlds, remainder = divmod(n_entities, world_size)
+    if remainder == 0:
+        yield from (world_size for _ in range(full_worlds))
+        return
+    if remainder >= MIN_REASONING_ENTITIES:
+        yield from (world_size for _ in range(full_worlds - 1))
+        combined = world_size + remainder
+        first = combined // 2
+        yield first
+        yield combined - first
+        return
+
+    deficit = MIN_REASONING_ENTITIES - remainder
+    donor_size = world_size - deficit
+    yield from (world_size for _ in range(max(0, full_worlds - 1)))
+    if donor_size >= MIN_REASONING_ENTITIES:
+        yield donor_size
+        yield MIN_REASONING_ENTITIES
+    else:
+        yield world_size + remainder
+
+
 def iter_worlds(
     n_entities: int,
     world_size: int,
     seed: int,
     world_id_offset: int = 0,
 ) -> Iterator[GraphWorld]:
-    if n_entities < 0:
-        raise ValueError("n_entities must be non-negative")
-    if world_size <= 0:
-        raise ValueError("world_size must be positive")
+    if n_entities < MIN_REASONING_ENTITIES:
+        raise ValueError(
+            f"n_entities must be at least {MIN_REASONING_ENTITIES}"
+        )
+    if world_size < MIN_REASONING_ENTITIES:
+        raise ValueError(
+            f"world_size must be at least {MIN_REASONING_ENTITIES}"
+        )
     if world_id_offset < 0:
         raise ValueError("world_id_offset must be non-negative")
 
-    for ordinal, start in enumerate(range(0, n_entities, world_size)):
-        size = min(world_size, n_entities - start)
-        world_id = world_id_offset + ordinal
-        yield generate_world(
-            world_id,
-            WorldConfig(
-                n_entities=size,
-                seed=seed,
-                entity_id_offset=world_id * world_size,
-            ),
-        )
+    def worlds() -> Iterator[GraphWorld]:
+        for ordinal, size in enumerate(
+            _iter_world_sizes(n_entities, world_size)
+        ):
+            world_id = world_id_offset + ordinal
+            yield generate_world(
+                world_id,
+                WorldConfig(
+                    n_entities=size,
+                    seed=seed,
+                    entity_id_offset=world_id * world_size,
+                ),
+            )
+
+    return worlds()
 
 
 def _row_map(world: GraphWorld) -> dict[GraphAddress, GraphFact]:
@@ -415,8 +461,10 @@ def _generate_eval_pairs(
         raise ValueError(f"path_hops must be one of {CURRICULUM_HOPS}")
 
     entity_ids = _entity_ids(world)
-    if len(entity_ids) < 4:
-        raise ValueError("reasoning worlds must contain at least four entities")
+    if len(entity_ids) < MIN_REASONING_ENTITIES:
+        raise ValueError(
+            "reasoning worlds must contain at least sixteen entities"
+        )
     names = dict(zip(entity_ids, world.entity_names))
     rows = _row_map(world)
     category_groups = _category_groups(entity_ids, rows)
