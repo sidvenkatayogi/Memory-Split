@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "label": "mit-collaborator-a",
+  "platform": "mit",
+  "scale": "360m",
+  "source_revision": "0045398a8a8c4cfde13c24192efdf42f361e1913",
+  "bundle_sha256": "e6b1e64d6c984ee3f04141d08e870b8f2aa7c2a72e130ce32e08da8dd15cc4dc",
+  "configs": [
+    "configs/360m/d360m_dense_n1p8m_s0.yaml",
+    "configs/360m/d360m_split_n1p8m_s0.yaml",
+    "configs/360m/d360m_dense_n1p8m_s2.yaml"
+  ],
+  "corpora_owned": [
+    {
+      "data_rel": "n1p8m_ds10000",
+      "entities": 1800000,
+      "tokens": 3599761408,
+      "data_seed": 10000
+    }
+  ],
+  "bed_owner": true
+}

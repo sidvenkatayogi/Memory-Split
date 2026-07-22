@@ -1,0 +1,88 @@
+{
+  "bundle": {
+    "archive_sha256": "e6b1e64d6c984ee3f04141d08e870b8f2aa7c2a72e130ce32e08da8dd15cc4dc",
+    "member_count": 126,
+    "policy": {
+      "hop_cost": 0.25,
+      "read_cost": 0.25,
+      "write_cost": 1.0
+    },
+    "policy_sha256": "0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058",
+    "run_counts": {
+      "160m": 15,
+      "360m": 6
+    },
+    "smoke_report": {
+      "dense_steps": 2,
+      "memory_modes": [
+        "off",
+        "on"
+      ],
+      "pairs_complete": true,
+      "resume_exact": true,
+      "shared_stream": true,
+      "split_steps": 2
+    },
+    "tokenizer_assets": 2
+  },
+  "checks": {
+    "bundle_hashes": {
+      "detail": {
+        "archive_sha256": "e6b1e64d6c984ee3f04141d08e870b8f2aa7c2a72e130ce32e08da8dd15cc4dc",
+        "member_count": 126,
+        "policy": {
+          "hop_cost": 0.25,
+          "read_cost": 0.25,
+          "write_cost": 1.0
+        },
+        "policy_sha256": "0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058",
+        "run_counts": {
+          "160m": 15,
+          "360m": 6
+        },
+        "smoke_report": {
+          "dense_steps": 2,
+          "memory_modes": [
+            "off",
+            "on"
+          ],
+          "pairs_complete": true,
+          "resume_exact": true,
+          "shared_stream": true,
+          "split_steps": 2
+        },
+        "tokenizer_assets": 2
+      },
+      "passed": true
+    },
+    "dependencies": {
+      "detail": {
+        "modules": [
+          "torch",
+          "numpy",
+          "tiktoken",
+          "yaml"
+        ]
+      },
+      "passed": true
+    },
+    "smoke": {
+      "detail": {
+        "dense_steps": 2,
+        "memory_modes": [
+          "off",
+          "on"
+        ],
+        "pairs_complete": true,
+        "resume_exact": true,
+        "shared_stream": true,
+        "split_steps": 2
+      },
+      "passed": true
+    }
+  },
+  "ok": true,
+  "platform": "local",
+  "profile": null,
+  "schema_version": 1
+}
