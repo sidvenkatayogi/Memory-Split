@@ -13,6 +13,7 @@ from typing import Iterable
 import numpy as np
 
 from corpusgen.graph_records import (
+    GraphAction,
     RANDOM_CONTROL_POSITION_BINS,
     RenderedRecord,
     relative_position_bin,
@@ -25,6 +26,7 @@ from corpusgen.srgm_worlds import (
     iter_graph_records,
     iter_reasoning_records,
     iter_worlds,
+    make_factual_recall_item,
 )
 
 
@@ -37,6 +39,12 @@ _EVAL_TASKS = (
     "date_ordering",
     "balanced_equality",
 )
+_PROTECTED_TARGET_ROLES = {
+    "rule",
+    "action",
+    "provisional_answer",
+    "final_answer",
+}
 _COMPONENT_ORDER = tuple(COMPONENT_SHARES)
 _ROUTE_WORLD_ID = 1 << 30
 _EVAL_WORLD_ID = 1 << 31
@@ -135,6 +143,8 @@ class RelationalBuildConfig:
     eval_pairs_per_task: int = 10_000
     eval_pairs_per_world: int = 32
     route_stats_pairs_per_task: int = 64
+    guardrail_items: int = 10_000
+    shared_text_eval_count: int = 64
 
     def __post_init__(self) -> None:
         if self.n_entities < 16:
@@ -151,6 +161,10 @@ class RelationalBuildConfig:
             raise ValueError("eval_pairs_per_world must be positive")
         if self.route_stats_pairs_per_task <= 0:
             raise ValueError("route_stats_pairs_per_task must be positive")
+        if self.guardrail_items <= 0:
+            raise ValueError("guardrail_items must be positive")
+        if self.shared_text_eval_count <= 0:
+            raise ValueError("shared_text_eval_count must be positive")
 
 
 BuildCfg = RelationalBuildConfig
@@ -458,6 +472,7 @@ class SharedCorpusWriter:
         self.component_tokens: Counter[str] = Counter()
         self.component_records: Counter[str] = Counter()
         self.external_payload_tokens = 0
+        self.protected_target_tokens = 0
         self.masked_tokens: Counter[str] = Counter()
         self.span_histograms = {
             "split": Counter(),
@@ -690,6 +705,8 @@ class SharedCorpusWriter:
         for span in spans:
             if span.role != "payload" and not split[span.start : span.end].all():
                 self.protected_roles_unmasked = False
+            if span.role in _PROTECTED_TARGET_ROLES:
+                self.protected_target_tokens += span.end - span.start
 
         self.total += len(token_ids)
         self.records += 1
@@ -738,14 +755,233 @@ def _calibrate_policy(cfg: RelationalBuildConfig) -> tuple[RoutePolicy, dict]:
     return policy, calibration
 
 
+def _payload_choice_text(row) -> str:
+    return _canonical_json(
+        {
+            "target_kind": row.target_kind,
+            "target": row.target,
+            "qualifiers": list(row.qualifiers),
+        }
+    )
+
+
+def _choices_are_prefix_free(tok, choices: list[str]) -> bool:
+    encoded = [tuple(tok.encode(choice)) for choice in choices]
+    return (
+        all(encoded)
+        and len(set(encoded)) == len(encoded)
+        and all(
+            not (
+                len(left) < len(right)
+                and right[: len(left)] == left
+            )
+            for left in encoded
+            for right in encoded
+            if left != right
+        )
+    )
+
+
+def _fact_choice_item(world, fact, ordinal: int, tok, kind: str):
+    correct = _payload_choice_text(fact.row)
+    candidates = sorted(
+        {
+            _payload_choice_text(candidate.row)
+            for candidate in world.facts
+            if candidate.row.relation_id == fact.row.relation_id
+            and candidate.row.direction == fact.row.direction
+            and candidate.fact_id != fact.fact_id
+        }
+    )
+    candidates = [choice for choice in candidates if choice != correct]
+    if len(candidates) < 3:
+        return None
+    offset = ordinal % len(candidates)
+    distractors = [
+        candidates[(offset + index) % len(candidates)]
+        for index in range(3)
+    ]
+    answer_index = ordinal % 4
+    choices = distractors.copy()
+    choices.insert(answer_index, correct)
+    if not _choices_are_prefix_free(tok, choices):
+        return None
+    return {
+        "qid": f"{kind}-{world.world_id}-{fact.fact_id}-{ordinal}",
+        "kind": kind,
+        "prompt": (
+            f"Source {fact.row.source_id} relation "
+            f"{fact.row.relation_id} returns "
+        ),
+        "choices": choices,
+        "answer_index": answer_index,
+        "fact_id": fact.fact_id,
+    }
+
+
+_RULE_CHOICE_ITEMS = (
+    (
+        "Composition adds retrieved compose codes",
+        (
+            " modulo four.",
+            " by string concatenation.",
+            " by taking their maximum.",
+            " without preserving order.",
+        ),
+    ),
+    (
+        "Inverse traversal",
+        (
+            " reverses edge direction.",
+            " deletes the source entity.",
+            " changes every relation id.",
+            " returns an arbitrary literal.",
+        ),
+    ),
+    (
+        "Equality",
+        (
+            " is symmetric.",
+            " depends on branch order.",
+            " is always false.",
+            " applies only to dates.",
+        ),
+    ),
+    (
+        "Earlier dates",
+        (
+            " have smaller ISO-8601 strings.",
+            " have larger ISO-8601 strings.",
+            " cannot be compared lexically.",
+            " are selected at random.",
+        ),
+    ),
+)
+
+
+def _rule_choice_item(ordinal: int, tok) -> dict:
+    prompt, raw_choices = _RULE_CHOICE_ITEMS[
+        ordinal % len(_RULE_CHOICE_ITEMS)
+    ]
+    answer_index = ordinal % 4
+    choices = list(raw_choices[1:])
+    choices.insert(answer_index, raw_choices[0])
+    if not _choices_are_prefix_free(tok, choices):
+        raise ValueError("rule answer choices must be token-prefix free")
+    return {
+        "qid": f"internal-rule-{ordinal}",
+        "kind": "rule",
+        "prompt": prompt,
+        "choices": choices,
+        "answer_index": answer_index,
+    }
+
+
+def _repeat_fact_items(sources, count: int, tok, kind: str) -> list[dict]:
+    if not sources:
+        raise ValueError(f"no facts available for {kind} evaluation")
+    items = []
+    ordinal = 0
+    while len(items) < count:
+        world, fact = sources[ordinal % len(sources)]
+        item = _fact_choice_item(world, fact, ordinal, tok, kind)
+        if item is None:
+            raise ValueError(f"could not construct prefix-free {kind} choices")
+        items.append(item)
+        ordinal += 1
+    return items
+
+
+def _reserve_shared_text(bed_iter, tok, count: int):
+    iterator = iter(bed_iter)
+    heldout_rows = []
+    heldout_source = set()
+    while len(heldout_rows) < count:
+        try:
+            raw = next(iterator)
+        except StopIteration as error:
+            raise ValueError(
+                "natural-text stream ended before shared-text holdout"
+            ) from error
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("shared-text holdout requires non-empty strings")
+        token_ids = tok.encode(raw)
+        if not token_ids:
+            raise ValueError("shared-text holdout encoded to no tokens")
+        heldout_rows.append({"text": tok.decode(token_ids[:512])})
+        heldout_source.add(raw)
+
+    def training_stream():
+        for text in iterator:
+            if text not in heldout_source:
+                yield text
+
+    return heldout_rows, training_stream()
+
+
+def _write_guardrail_eval_files(
+    eval_dir: Path,
+    guardrail_data: dict,
+    shared_text_rows: list[dict],
+) -> dict:
+    paths = {
+        "recognition": eval_dir / "recognition.jsonl",
+        "factual": eval_dir / "factual.jsonl",
+        "factual_graph": eval_dir / "factual-graph.jsonl",
+        "internal": eval_dir / "internal.jsonl",
+        "shared_text": eval_dir / "shared_text.jsonl",
+        "route_audit": eval_dir / "route-audit.json",
+    }
+    for name in ("recognition", "internal"):
+        paths[name].write_text(
+            "".join(_json_line(item) for item in guardrail_data[name])
+        )
+    paths["factual"].write_text(
+        "".join(
+            _json_line(asdict(item))
+            for item in guardrail_data["factual"]
+        )
+    )
+    paths["factual_graph"].write_text(
+        "".join(
+            _json_line(row.as_json())
+            for row in guardrail_data["factual_rows"]
+        )
+    )
+    paths["shared_text"].write_text(
+        "".join(_json_line(item) for item in shared_text_rows)
+    )
+    _write_json(paths["route_audit"], guardrail_data["route_audit"])
+    return {
+        "guardrail_items": len(guardrail_data["recognition"]),
+        "shared_text_items": len(shared_text_rows),
+        "guardrail_paths": {
+            name: path.relative_to(eval_dir.parent).as_posix()
+            for name, path in paths.items()
+        },
+        "guardrail_sha256": {
+            name: _sha256_file(path) for name, path in paths.items()
+        },
+    }
+
+
 def _write_training_graph(
     cfg: RelationalBuildConfig,
     policy: RoutePolicy,
     stats_seed: int,
     path: Path,
-) -> dict:
+    tok,
+) -> tuple[dict, dict]:
     rows = 0
     external = 0
+    tail_total = 0
+    tail_external = 0
+    structure_total = 0
+    structure_internal = 0
+    recognition_sources = []
+    factual_sources = []
+    central_sources = []
+    central_target = (cfg.guardrail_items + 1) // 2
     with path.open("w") as handle:
         for world in iter_worlds(
             cfg.n_entities,
@@ -760,14 +996,109 @@ def _write_training_graph(
             for fact in world.facts:
                 handle.write(_json_line(fact.row.as_json()))
                 rows += 1
-                external += policy.is_external(costs[fact.fact_id])
-    return {
+                routed = policy.is_external(costs[fact.fact_id])
+                external += routed
+                is_tail = (
+                    fact.features.payload_entropy >= 6.0
+                    and fact.features.expected_queries <= 0.25
+                    and fact.features.path_centrality <= 0.05
+                )
+                if is_tail:
+                    tail_total += 1
+                    tail_external += routed
+                is_central = fact.features.path_centrality >= 1.0
+                if is_central:
+                    structure_total += 1
+                    structure_internal += not routed
+
+                if routed and len(recognition_sources) < cfg.guardrail_items:
+                    if _fact_choice_item(
+                        world,
+                        fact,
+                        len(recognition_sources),
+                        tok,
+                        "external_fact",
+                    ) is not None:
+                        recognition_sources.append((world, fact))
+                if (
+                    routed
+                    and fact.row.target_kind == "entity"
+                    and len(factual_sources) < cfg.guardrail_items
+                ):
+                    factual_sources.append((world, fact))
+                if (
+                    not routed
+                    and fact.audit_class == "central"
+                    and len(central_sources) < central_target
+                ):
+                    if _fact_choice_item(
+                        world,
+                        fact,
+                        len(central_sources),
+                        tok,
+                        "central_fact",
+                    ) is not None:
+                        central_sources.append((world, fact))
+            structure_total += 1
+            structure_internal += 1
+
+    if tail_total <= 0 or structure_total <= 0:
+        raise ValueError("route audit strata must be non-empty")
+    route_audit = {
+        "route_rate": external / rows,
+        "route_total": rows,
+        "low_use_high_entropy_external_rate": tail_external / tail_total,
+        "low_use_high_entropy_total": tail_total,
+        "rules_top_centrality_internal_rate": (
+            structure_internal / structure_total
+        ),
+        "rules_top_centrality_total": structure_total,
+    }
+    recognition = _repeat_fact_items(
+        recognition_sources,
+        cfg.guardrail_items,
+        tok,
+        "external_fact",
+    )
+    if not factual_sources:
+        raise ValueError("no external entity facts for factual evaluation")
+    factual = []
+    for ordinal in range(cfg.guardrail_items):
+        world, fact = factual_sources[ordinal % len(factual_sources)]
+        factual.append(
+            make_factual_recall_item(world, fact, ordinal)
+        )
+    central_count = (cfg.guardrail_items + 1) // 2
+    internal = _repeat_fact_items(
+        central_sources,
+        central_count,
+        tok,
+        "central_fact",
+    )
+    internal.extend(
+        _rule_choice_item(index, tok)
+        for index in range(cfg.guardrail_items - central_count)
+    )
+    factual_rows_by_address = {
+        fact.row.address: fact.row for _, fact in factual_sources
+    }
+    manifest = {
         "path": path.name,
         "sha256": _sha256_file(path),
         "bytes": path.stat().st_size,
         "rows": rows,
         "entities": cfg.n_entities,
         "route_rate": external / rows,
+    }
+    return manifest, {
+        "recognition": recognition,
+        "factual": factual,
+        "factual_rows": tuple(
+            row
+            for _, row in sorted(factual_rows_by_address.items())
+        ),
+        "internal": internal,
+        "route_audit": route_audit,
     }
 
 
@@ -828,6 +1159,44 @@ def validate_eval_sets(
     original_path: Path,
     counterfactual_path: Path,
 ) -> dict[str, bool]:
+    def validate_gold_actions(meta: dict) -> list[GraphAction]:
+        raw_actions = meta.get("gold_actions")
+        if not isinstance(raw_actions, list) or len(raw_actions) != 6:
+            raise ValueError("gold actions must contain exactly six steps")
+        required = {
+            "source_slot",
+            "relation_id",
+            "direction",
+            "read",
+            "halt",
+        }
+        actions = []
+        for raw in raw_actions:
+            if not isinstance(raw, dict) or set(raw) != required:
+                raise ValueError("gold actions have invalid fields")
+            actions.append(GraphAction(**raw))
+        halts = [
+            index for index, action in enumerate(actions) if action.halt
+        ]
+        if len(halts) != 1:
+            raise ValueError("gold actions require exactly one HALT")
+        halt = halts[0]
+        if not all(action.read for action in actions[:halt]):
+            raise ValueError("gold actions before HALT must be reads")
+        if any(
+            action.read or action.halt for action in actions[halt + 1 :]
+        ):
+            raise ValueError("gold actions after HALT must be NOOP")
+        addresses = meta["gold_addresses"]
+        reads = [action for action in actions if action.read]
+        if len(reads) != len(addresses) or any(
+            action.relation_id != str(address[1])
+            or action.direction != str(address[2])
+            for action, address in zip(reads, addresses)
+        ):
+            raise ValueError("gold actions do not match gold addresses")
+        return actions
+
     task_counts = {
         "original": Counter(),
         "counterfactual": Counter(),
@@ -853,6 +1222,12 @@ def validate_eval_sets(
             counterfactual = json.loads(counterfactual_line)
             original_meta = original["meta"]
             counterfactual_meta = counterfactual["meta"]
+            original_actions = validate_gold_actions(original_meta)
+            counterfactual_actions = validate_gold_actions(
+                counterfactual_meta
+            )
+            if original_actions != counterfactual_actions:
+                raise ValueError("eval twins must share exact gold actions")
             pair_id = original_meta["pair_id"]
             if (
                 pair_id != counterfactual_meta["pair_id"]
@@ -983,6 +1358,7 @@ def validate_eval_sets(
         "two_variants_per_pair": True,
         "answer_flips": True,
         "changed_supporting_row": True,
+        "explicit_gold_actions": True,
         "fresh_sources_disjoint": True,
     }
 
@@ -997,6 +1373,11 @@ def build_relational_corpus(
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_dir = out_dir / "eval"
     eval_dir.mkdir(exist_ok=True)
+    shared_text_rows, bed_iter = _reserve_shared_text(
+        bed_iter,
+        tok,
+        cfg.shared_text_eval_count,
+    )
 
     policy, calibration = _calibrate_policy(cfg)
     policy_path = out_dir / "route-policy.json"
@@ -1022,16 +1403,23 @@ def build_relational_corpus(
 
     protected_stats_seed = cfg.data_seed ^ _ROUTE_STATS_SEED_XOR
     graph_path = out_dir / "graph.jsonl"
-    graph_manifest = _write_training_graph(
+    graph_manifest, guardrail_data = _write_training_graph(
         cfg,
         policy,
         protected_stats_seed,
         graph_path,
+        tok,
     )
     graph_manifest_path = out_dir / "graph-manifest.json"
     _write_json(graph_manifest_path, graph_manifest)
 
     eval_report = _write_eval_sets(cfg, eval_dir)
+    guardrail_report = _write_guardrail_eval_files(
+        eval_dir,
+        guardrail_data,
+        shared_text_rows,
+    )
+    eval_report.update(guardrail_report)
     eval_checks = validate_eval_sets(
         cfg,
         graph_path,
@@ -1051,6 +1439,7 @@ def build_relational_corpus(
                 "counterfactual": _sha256_file(
                     eval_dir / "counterfactual.jsonl"
                 ),
+                **guardrail_report["guardrail_sha256"],
             },
         },
     )
@@ -1234,6 +1623,7 @@ def build_relational_corpus(
                     writer._actual_range_digest.hexdigest()
                 ),
             },
+            "protected_target_tokens": writer.protected_target_tokens,
         },
     )
 
@@ -1354,6 +1744,7 @@ def build_relational_corpus(
             ),
             "split_masked_tokens": split_mass,
             "random_masked_tokens": random_mass,
+            "protected_target_tokens": writer.protected_target_tokens,
             "split_span_histogram": {
                 str(length): count
                 for length, count in sorted(
@@ -1403,6 +1794,12 @@ def build_relational_corpus(
         eval_dir / "graph.jsonl",
         eval_dir / "original.jsonl",
         eval_dir / "counterfactual.jsonl",
+        eval_dir / "recognition.jsonl",
+        eval_dir / "factual.jsonl",
+        eval_dir / "factual-graph.jsonl",
+        eval_dir / "internal.jsonl",
+        eval_dir / "shared_text.jsonl",
+        eval_dir / "route-audit.json",
         report_path,
     ]
     artifacts = sorted(

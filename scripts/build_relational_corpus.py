@@ -53,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--world-size", type=int, default=64)
     parser.add_argument("--eval-pairs-per-task", type=int, default=10_000)
     parser.add_argument("--eval-pairs-per-world", type=int, default=32)
+    parser.add_argument("--guardrail-items", type=int, default=10_000)
+    parser.add_argument("--shared-text-eval-count", type=int, default=64)
     args = parser.parse_args(argv)
 
     cfg = RelationalBuildConfig(
@@ -62,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         world_size=args.world_size,
         eval_pairs_per_task=args.eval_pairs_per_task,
         eval_pairs_per_world=args.eval_pairs_per_world,
+        guardrail_items=args.guardrail_items,
+        shared_text_eval_count=args.shared_text_eval_count,
     )
     report = build_relational_corpus(
         cfg,

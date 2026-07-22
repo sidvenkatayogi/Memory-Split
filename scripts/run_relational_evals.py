@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,14 +28,19 @@ from evals.relational_metrics import (
     EXPECTED_TASKS,
     assert_expected_counts,
     counterfactual_pair_accuracy,
+    exact_accuracy,
     mask_ledger_guardrail,
+    measure_shared_text_bpb,
     path_diagnostics,
     path_metrics,
+    recognition_accuracy,
     route_guardrails,
+    score_choice_loglikelihoods,
 )
 from evals.scorers import normalize_answer
 from organizer.graph_store import AtomicGraphStore
 from train.model import GPT, GPTConfig, PRESETS
+from train.tokenizer import get_tok
 from train.trainer import pick_device
 
 
@@ -118,27 +124,43 @@ def _action_json(action: GraphAction) -> list:
 
 def _gold_actions(item) -> list[GraphAction]:
     meta = _item_meta(item)
-    task = item["task"] if isinstance(item, dict) else item.task
-    addresses = meta["gold_addresses"]
-    if not isinstance(addresses, list) or not addresses:
-        raise ValueError("gold_addresses must contain at least one hop")
-    if task not in EXPECTED_TASKS:
-        raise ValueError(f"unexpected relational task: {task}")
+    raw_actions = meta["gold_actions"]
+    if not isinstance(raw_actions, list) or len(raw_actions) != 6:
+        raise ValueError("gold_actions must contain exactly six actions")
     actions = []
-    for index, raw in enumerate(addresses):
-        if not isinstance(raw, list) or len(raw) != 3:
-            raise ValueError("gold graph addresses require three fields")
-        _, relation, direction = raw
-        source_slot = 0 if task == "path_composition" else index
-        actions.append(
-            GraphAction(
-                source_slot=source_slot,
-                relation_id=str(relation),
-                direction=direction,
-                read=True,
-                halt=False,
-            )
-        )
+    required = {
+        "source_slot",
+        "relation_id",
+        "direction",
+        "read",
+        "halt",
+    }
+    for raw in raw_actions:
+        if not isinstance(raw, dict) or set(raw) != required:
+            raise ValueError("gold action fields do not match the contract")
+        actions.append(GraphAction(**raw))
+    halt_positions = [
+        index for index, action in enumerate(actions) if action.halt
+    ]
+    if len(halt_positions) != 1:
+        raise ValueError("gold_actions require exactly one HALT")
+    halt = halt_positions[0]
+    if not all(action.read for action in actions[:halt]):
+        raise ValueError("gold actions before HALT must be reads")
+    if any(
+        action.read or action.halt for action in actions[halt + 1 :]
+    ):
+        raise ValueError("gold actions after HALT must be NOOP")
+    addresses = meta["gold_addresses"]
+    read_actions = [action for action in actions if action.read]
+    if len(read_actions) != len(addresses):
+        raise ValueError("gold action/address counts differ")
+    if any(
+        action.relation_id != str(address[1])
+        or action.direction != str(address[2])
+        for action, address in zip(read_actions, addresses)
+    ):
+        raise ValueError("gold actions do not match gold addresses")
     return actions
 
 
@@ -155,7 +177,10 @@ def _states_to_rows(items, states: list[GraphDecodeState]) -> list[dict]:
         ):
             raise ValueError("every decoded state must contain six steps")
         meta = _item_meta(item)
-        gold_actions = _gold_actions(item)
+        gold_all_actions = _gold_actions(item)
+        gold_actions = [
+            action for action in gold_all_actions if action.read
+        ]
         gold_addresses = [
             GraphAddress(int(source), str(relation), direction)
             for source, relation, direction in meta["gold_addresses"]
@@ -199,9 +224,13 @@ def _states_to_rows(items, states: list[GraphDecodeState]) -> list[dict]:
                 "gold_actions": [
                     _action_json(action) for action in gold_actions
                 ],
+                "gold_all_actions": [
+                    _action_json(action) for action in gold_all_actions
+                ],
                 "correct_referents": correct_referents,
                 "misses": state.misses,
-                "malformed": state.malformed,
+                # The constrained action grammar cannot emit malformed frames.
+                "malformed": 0,
                 "excess_reads": max(
                     0, len(predicted_reads) - len(gold_actions)
                 ),
@@ -254,22 +283,181 @@ def _summary(rows: list[dict], expected_pairs: int, memory: str) -> dict:
     }
 
 
-def _validate_accuracy(value: dict, name: str) -> None:
-    accuracy = float(value["accuracy"])
-    n = value["n"]
-    if not 0 <= accuracy <= 1:
-        raise ValueError(f"{name} accuracy must be in [0, 1]")
-    if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
-        raise ValueError(f"{name} n must be positive")
-
-
-def _load_guardrail_measurements(path: Path) -> dict:
+def _read_json(path: Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(path)
     value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON input must contain an object: {path}")
+    return value
+
+
+def _mask_audit_from_committed_data(
+    data_dir: Path,
+    condition: str,
+) -> dict:
+    ledger = _read_jsonl(data_dir / "mask-ledger.jsonl")
+    report = _read_json(data_dir / "report.json")
+    expected = Counter(
+        (row["start"], row["end"], row["fact_id"])
+        for row in ledger
+        if row["condition"] == "expected_split"
+    )
+    split = Counter(
+        (row["start"], row["end"], row["fact_id"])
+        for row in ledger
+        if row["condition"] == "split"
+    )
+    if split - expected:
+        raise ValueError("split ledger contains unexpected payload ranges")
+    selected_condition = [
+        row for row in ledger if row["condition"] == condition
+    ]
+    protected_roles = {
+        "rule",
+        "action",
+        "provisional_answer",
+        "final_answer",
+    }
+    if condition == "split":
+        unmasked_external = sum((expected - split).values())
+    else:
+        unmasked_external = sum(expected.values())
+    return {
+        "unmasked_external_payloads": unmasked_external,
+        "external_payload_occurrences": sum(expected.values()),
+        "masked_rule_action_answer_targets": sum(
+            int(row["length"])
+            for row in selected_condition
+            if row["role"] in protected_roles
+        ),
+        "rule_action_answer_targets": int(
+            report["masks"]["protected_target_tokens"]
+        ),
+    }
+
+
+def produce_guardrail_measurements(
+    model,
+    tok,
+    data_dir: Path | str,
+    *,
+    condition: str,
+    device,
+    batch_size: int,
+) -> dict:
+    data_dir = Path(data_dir)
+    if condition not in ("dense", "split", "random"):
+        raise ValueError(f"unexpected training condition: {condition}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    eval_manifest = _read_json(data_dir / "eval-manifest.json")
+    expected_items = int(eval_manifest["guardrail_items"])
+    expected_shared = int(eval_manifest["shared_text_items"])
+    recognition_items = _read_jsonl(
+        data_dir / "eval" / "recognition.jsonl"
+    )
+    factual_items = [
+        QAItem(**row)
+        for row in _read_jsonl(data_dir / "eval" / "factual.jsonl")
+    ]
+    internal_items = _read_jsonl(data_dir / "eval" / "internal.jsonl")
+    shared_rows = _read_jsonl(
+        data_dir / "eval" / "shared_text.jsonl"
+    )
+    for name, values, expected in (
+        ("recognition", recognition_items, expected_items),
+        ("factual", factual_items, expected_items),
+        ("internal", internal_items, expected_items),
+        ("shared_text", shared_rows, expected_shared),
+    ):
+        if len(values) != expected:
+            raise ValueError(
+                f"{name}: expected {expected} items, got {len(values)}"
+            )
+
+    choice_score_cache = {}
+
+    def score_choices(prompt, choices):
+        key = (prompt, tuple(choices))
+        if key not in choice_score_cache:
+            choice_score_cache[key] = score_choice_loglikelihoods(
+                model,
+                tok,
+                prompt,
+                choices,
+                device=device,
+            )
+        return choice_score_cache[key]
+
+    recognition = recognition_accuracy(
+        score_choices,
+        recognition_items,
+        expected_count=expected_items,
+    )
+    internal = recognition_accuracy(
+        score_choices,
+        internal_items,
+        expected_count=expected_items,
+    )
+    internal["per_kind"] = {
+        kind: recognition_accuracy(
+            score_choices,
+            [item for item in internal_items if item["kind"] == kind],
+        )
+        for kind in ("rule", "central_fact")
+    }
+    language = measure_shared_text_bpb(
+        model,
+        tok,
+        [row["text"] for row in shared_rows],
+        device=device,
+    )
+
+    factual_store = AtomicGraphStore.load(
+        data_dir / "eval" / "factual-graph.jsonl"
+    )
+    factual_measurements = {}
+    for memory in ("off", "on"):
+        memory_on = memory == "on"
+        states = decode_items(
+            model,
+            tok,
+            factual_items,
+            lambda item, enabled=memory_on: store_for_item(
+                factual_store,
+                item,
+                memory_on=enabled,
+            ),
+            device=device,
+            batch_size=batch_size,
+        )
+        factual_measurements[memory] = exact_accuracy(
+            _states_to_rows(factual_items, states),
+            expected_count=expected_items,
+        )
+
+    route = _read_json(data_dir / "eval" / "route-audit.json")
+    mask_audit = _mask_audit_from_committed_data(data_dir, condition)
+    return {
+        "within_run_guardrails": {
+            "route": route_guardrails(route),
+            "mask": mask_ledger_guardrail(
+                mask_audit,
+                condition=condition,
+            ),
+        },
+        "recognition_store_off": recognition,
+        "factual_recall": factual_measurements,
+        "internal_accuracy": internal,
+        "language": language,
+    }
+
+
+def _validate_guardrail_schema(value: dict) -> None:
     required = {
-        "route",
-        "mask",
+        "within_run_guardrails",
         "recognition_store_off",
         "factual_recall",
         "internal_accuracy",
@@ -281,32 +469,6 @@ def _load_guardrail_measurements(path: Path) -> dict:
             f"missing={sorted(required - set(value))}, "
             f"extra={sorted(set(value) - required)}"
         )
-    route = route_guardrails(value["route"])
-    mask = mask_ledger_guardrail(value["mask"])
-    recognition = value["recognition_store_off"]
-    _validate_accuracy(recognition, "recognition_store_off")
-    for mode in ("on", "off"):
-        _validate_accuracy(
-            value["factual_recall"][mode],
-            f"factual_recall.{mode}",
-        )
-    _validate_accuracy(value["internal_accuracy"], "internal_accuracy")
-    language = value["language"]
-    if float(language["bpb"]) < 0:
-        raise ValueError("language BPB must be non-negative")
-    if (
-        isinstance(language["total_utf8_bytes"], bool)
-        or not isinstance(language["total_utf8_bytes"], int)
-        or language["total_utf8_bytes"] <= 0
-    ):
-        raise ValueError("language byte count must be positive")
-    return {
-        **value,
-        "within_run_guardrails": {
-            "route": route,
-            "mask": mask,
-        },
-    }
 
 
 def _resolve_data_dir(cfg: dict, override: str | None) -> Path:
@@ -361,7 +523,6 @@ def main() -> None:
     parser.add_argument("--run", required=True)
     parser.add_argument("--checkpoint", default="ckpt.pt")
     parser.add_argument("--data-dir")
-    parser.add_argument("--guardrails-json", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
@@ -378,15 +539,19 @@ def main() -> None:
     device = pick_device(args.device)
     model, cfg = _load_model(run, args.checkpoint, device)
     data_dir = _resolve_data_dir(cfg, args.data_dir)
+    tok = get_tok()
     items = _load_eval_items(data_dir, args.expected_pairs)
     base_store = AtomicGraphStore.load(data_dir / "eval" / "graph.jsonl")
-    measurements = _load_guardrail_measurements(
-        Path(args.guardrails_json)
+    measurements = produce_guardrail_measurements(
+        model,
+        tok=tok,
+        data_dir=data_dir,
+        condition=cfg["condition"],
+        device=device,
+        batch_size=args.batch_size,
     )
+    _validate_guardrail_schema(measurements)
 
-    from train.tokenizer import get_tok
-
-    tok = get_tok()
     output = run / "evals"
     output.mkdir(parents=True, exist_ok=True)
     mode_summaries = {}

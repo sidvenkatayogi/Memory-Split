@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from evals.relational_metrics import mask_ledger_guardrail
 from evals.relational_stats import (
     VerdictInputs,
     decide_verdict,
@@ -228,7 +229,17 @@ def test_complete_matrix_analysis_applies_two_load_and_360m_rules():
                     "tail_external": {"passed": True},
                     "structure_internal": {"passed": True},
                 },
-                "mask": {"passed": True},
+                "mask": mask_ledger_guardrail(
+                    {
+                        "unmasked_external_payloads": (
+                            0 if condition == "split" else 50
+                        ),
+                        "external_payload_occurrences": 50,
+                        "masked_rule_action_answer_targets": 0,
+                        "rule_action_answer_targets": 200,
+                    },
+                    condition=condition,
+                ),
             },
             "recognition_store_off": recognition,
             "factual_recall": {

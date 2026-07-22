@@ -41,6 +41,32 @@ def _item(suffix: str = "a") -> QAItem:
             "entity_slots": [7, 8, None, None],
             "gold_addresses": [[7, "r0", "out"]],
             "gold_fact_ids": ["fact-7"],
+            "gold_actions": [
+                {
+                    "source_slot": 0,
+                    "relation_id": "r0",
+                    "direction": "out",
+                    "read": True,
+                    "halt": False,
+                },
+                {
+                    "source_slot": 0,
+                    "relation_id": "r0",
+                    "direction": "out",
+                    "read": False,
+                    "halt": True,
+                },
+                *[
+                    {
+                        "source_slot": 0,
+                        "relation_id": "r0",
+                        "direction": "out",
+                        "read": False,
+                        "halt": False,
+                    }
+                    for _ in range(4)
+                ],
+            ],
             "answer_choices": ["<|slot_0|>", "<|slot_1|>"],
         },
     )
@@ -145,6 +171,8 @@ def test_memory_off_is_miss_and_halt_keeps_six_slots():
         not action.read and not action.halt for action in result.actions[2:]
     )
     assert len(result.provisional_answers) == 6
+    assert not hasattr(result, "malformed")
+    assert not hasattr(result, "excess_reads")
 
 
 def test_counterfactual_overlay_changes_only_one_row():
@@ -273,6 +301,79 @@ def test_state_rows_keep_six_steps_but_score_only_the_read_path():
     assert rows[0]["correct"]
 
 
+def test_state_rows_consume_explicit_multihop_gold_slots():
+    item = _item()
+    item.task = "path_composition"
+    item.meta["gold_addresses"] = [
+        [7, "r0", "out"],
+        [9, "r1", "out"],
+    ]
+    item.meta["gold_actions"] = [
+        {
+            "source_slot": 3,
+            "relation_id": "r0",
+            "direction": "out",
+            "read": True,
+            "halt": False,
+        },
+        {
+            "source_slot": 2,
+            "relation_id": "r1",
+            "direction": "out",
+            "read": True,
+            "halt": False,
+        },
+        {
+            "source_slot": 1,
+            "relation_id": "r7",
+            "direction": "in",
+            "read": False,
+            "halt": True,
+        },
+        *[
+            {
+                "source_slot": 1,
+                "relation_id": "r7",
+                "direction": "in",
+                "read": False,
+                "halt": False,
+            }
+            for _ in range(3)
+        ],
+    ]
+    returned = [
+        GraphRow(7, "r0", "out", "entity", "9", (), "world"),
+        GraphRow(9, "r1", "out", "entity", "10", (), "world"),
+    ]
+    actions = [
+        GraphAction(3, "r0", "out", True, False),
+        GraphAction(2, "r1", "out", True, False),
+        GraphAction(1, "r7", "in", False, True),
+        *[GraphAction(1, "r7", "in", False, False) for _ in range(3)],
+    ]
+    state = GraphDecodeState(
+        slots=[7, 8, 10, 9],
+        actions=actions,
+        rows=[*returned, None, None, None, None],
+        provisional_answers=["<|slot_0|>"] * 6,
+        halt_step=3,
+    )
+
+    row = _states_to_rows([item], [state])[0]
+
+    assert row["gold_actions"] == [
+        [3, "r0", "out", True, False],
+        [2, "r1", "out", True, False],
+    ]
+    assert row["gold_all_actions"][2] == [
+        1,
+        "r7",
+        "in",
+        False,
+        True,
+    ]
+
+
 def test_store_toggle_only_changes_the_store_view():
     item = _item()
     base = _store()
@@ -296,3 +397,4 @@ def test_relational_eval_command_is_repo_relative():
     )
     assert completed.returncode == 0, completed.stderr
     assert "--run" in completed.stdout
+    assert "--guardrails-json" not in completed.stdout

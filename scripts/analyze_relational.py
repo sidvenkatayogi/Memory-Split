@@ -160,7 +160,10 @@ def _flatten_static_guardrails(key, run, combined) -> None:
         raise ValueError("route guardrails must not be empty")
     for name, measurement in route.items():
         combined[f"{key}:route:{name}"] = measurement
-    combined[f"{key}:mask"] = within["mask"]
+    mask = within["mask"]
+    if mask["condition"] != key[1]:
+        raise ValueError("mask guardrail condition does not match run key")
+    combined[f"{key}:mask"] = mask
 
 
 def _collect_guardrails(runs: dict) -> dict[str, dict]:

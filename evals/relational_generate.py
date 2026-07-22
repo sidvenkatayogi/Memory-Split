@@ -27,8 +27,6 @@ class GraphDecodeState:
     rows: list[GraphRow | None] = field(default_factory=list)
     provisional_answers: list[str] = field(default_factory=list)
     misses: int = 0
-    malformed: int = 0
-    excess_reads: int = 0
     halt_step: int | None = None
 
     def __post_init__(self) -> None:

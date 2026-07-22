@@ -216,6 +216,9 @@ def test_factual_internal_and_language_guardrails_measure_paired_deltas():
 
     assert factual["passed"] and factual["value"] == pytest.approx(-0.02)
     assert internal["passed"] and internal["value"] == pytest.approx(-0.02)
+    assert factual["rule"] == "split >= dense - 0.02"
+    assert internal["rule"] == "split >= dense - 0.02"
+    assert factual["test"] == "one-sided noninferiority"
     assert language["passed"] and language["value"] == pytest.approx(1.01)
 
 
@@ -249,7 +252,8 @@ def test_route_and_mask_guardrails_require_measured_counts():
             "external_payload_occurrences": 50,
             "masked_rule_action_answer_targets": 0,
             "rule_action_answer_targets": 200,
-        }
+        },
+        condition="split",
     )
 
     assert all(value["passed"] for value in route.values())
@@ -257,3 +261,28 @@ def test_route_and_mask_guardrails_require_measured_counts():
 
     with pytest.raises(KeyError):
         route_guardrails({"route_rate": 0.5})
+
+
+@pytest.mark.parametrize("condition", ["dense", "random"])
+def test_non_split_ledgers_allow_factual_targets_to_remain_unmasked(condition):
+    faithful = mask_ledger_guardrail(
+        {
+            "unmasked_external_payloads": 50,
+            "external_payload_occurrences": 50,
+            "masked_rule_action_answer_targets": 0,
+            "rule_action_answer_targets": 200,
+        },
+        condition=condition,
+    )
+    split = mask_ledger_guardrail(
+        {
+            "unmasked_external_payloads": 50,
+            "external_payload_occurrences": 50,
+            "masked_rule_action_answer_targets": 0,
+            "rule_action_answer_targets": 200,
+        },
+        condition="split",
+    )
+
+    assert faithful["passed"] and not faithful["external_mask_applicable"]
+    assert not split["passed"] and split["external_mask_applicable"]

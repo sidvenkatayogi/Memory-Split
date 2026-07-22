@@ -178,6 +178,57 @@ def test_counterfactual_pairs_change_supporting_evidence_and_replay_to_flip():
         assert pair.changed_row.provenance_id == changed_original.provenance_id
 
 
+def test_eval_items_persist_exact_six_step_gold_actions():
+    world = generate_world(0, WorldConfig(n_entities=64, seed=7))
+    pairs = generate_eval_pairs(world, n_pairs_per_task=20, seed=17)
+
+    for pair in pairs:
+        for item in (pair.original, pair.counterfactual):
+            actions = item.meta["gold_actions"]
+            reads = [action for action in actions if action["read"]]
+
+            assert len(actions) == 6
+            assert len(reads) == len(item.meta["gold_addresses"])
+            assert [
+                [action["relation_id"], action["direction"]]
+                for action in reads
+            ] == [
+                [relation, direction]
+                for _, relation, direction in item.meta["gold_addresses"]
+            ]
+            halt = actions[len(reads)]
+            assert halt["halt"] and not halt["read"]
+            assert all(
+                not action["read"] and not action["halt"]
+                for action in actions[len(reads) + 1 :]
+            )
+
+
+def test_gold_action_slots_cover_multihop_paths_and_two_branch_reads():
+    world = generate_world(0, WorldConfig(n_entities=64, seed=13))
+    pairs = generate_eval_pairs(world, n_pairs_per_task=30, seed=19)
+    path = next(
+        pair.original
+        for pair in pairs
+        if pair.task == "path_composition"
+        and len(pair.original.meta["gold_addresses"]) >= 3
+    )
+    branch = next(
+        pair.original for pair in pairs if pair.task == "date_ordering"
+    )
+
+    assert {
+        action["source_slot"]
+        for action in path.meta["gold_actions"]
+        if action["read"]
+    } == {0}
+    assert [
+        action["source_slot"]
+        for action in branch.meta["gold_actions"]
+        if action["read"]
+    ] == [0, 1]
+
+
 def test_balanced_equality_twins_are_counterbalanced_in_both_orientations():
     world = generate_world(0, WorldConfig(n_entities=64, seed=23))
     equality_pairs = [

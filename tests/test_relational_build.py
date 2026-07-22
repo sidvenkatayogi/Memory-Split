@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from corpusgen import relational_build as relational
 from corpusgen.relational_build import (
@@ -223,6 +224,8 @@ def built(tmp_path_factory):
         data_seed=17,
         world_size=64,
         eval_pairs_per_task=4,
+        guardrail_items=8,
+        shared_text_eval_count=4,
     )
     report = build_relational_corpus(cfg, get_tok(), _bed_stream(), out)
     return out, cfg, report
@@ -389,6 +392,7 @@ def test_graph_policy_eval_and_manifests_are_portable(built):
         "two_variants_per_pair": True,
         "answer_flips": True,
         "changed_supporting_row": True,
+        "explicit_gold_actions": True,
         "fresh_sources_disjoint": True,
     }
 
@@ -397,6 +401,206 @@ def test_graph_policy_eval_and_manifests_are_portable(built):
         assert not relative.is_absolute()
         assert ".." not in relative.parts
         assert _sha256(out / relative) == artifact["sha256"]
+
+
+def test_builder_commits_all_guardrail_eval_inputs(built):
+    out, cfg, report = built
+    recognition = _read_jsonl(out / "eval" / "recognition.jsonl")
+    factual = _read_jsonl(out / "eval" / "factual.jsonl")
+    factual_graph = _read_jsonl(out / "eval" / "factual-graph.jsonl")
+    internal = _read_jsonl(out / "eval" / "internal.jsonl")
+    shared_text = _read_jsonl(out / "eval" / "shared_text.jsonl")
+    route = json.loads((out / "eval" / "route-audit.json").read_text())
+    manifest = json.loads((out / "manifest.json").read_text())
+    artifact_names = {item["path"] for item in manifest["artifacts"]}
+
+    assert len(recognition) == cfg.guardrail_items
+    assert len(factual) == cfg.guardrail_items
+    assert len(internal) == cfg.guardrail_items
+    assert len(shared_text) == cfg.shared_text_eval_count
+    assert all(
+        len(item["choices"]) == 4
+        and 0 <= item["answer_index"] < 4
+        for item in recognition + internal
+    )
+    assert all(
+        item["task"] == "factual_recall"
+        and len(item["meta"]["gold_actions"]) == 6
+        and item["meta"]["route"] == "external"
+        for item in factual
+    )
+    factual_addresses = {
+        (
+            row["source_id"],
+            row["relation_id"],
+            row["direction"],
+        )
+        for row in factual_graph
+    }
+    assert all(
+        tuple(item["meta"]["gold_addresses"][0]) in factual_addresses
+        for item in factual
+    )
+    assert {item["kind"] for item in internal} == {
+        "rule",
+        "central_fact",
+    }
+    assert set(route) == {
+        "route_rate",
+        "route_total",
+        "low_use_high_entropy_external_rate",
+        "low_use_high_entropy_total",
+        "rules_top_centrality_internal_rate",
+        "rules_top_centrality_total",
+    }
+    assert 0.40 <= route["route_rate"] <= 0.60
+    assert route["low_use_high_entropy_external_rate"] >= 0.80
+    assert route["rules_top_centrality_internal_rate"] >= 0.80
+    assert report["eval"]["guardrail_items"] == cfg.guardrail_items
+    assert {
+        "eval/recognition.jsonl",
+        "eval/factual.jsonl",
+        "eval/factual-graph.jsonl",
+        "eval/internal.jsonl",
+        "eval/shared_text.jsonl",
+        "eval/route-audit.json",
+    } <= artifact_names
+
+
+def test_real_eval_answer_choices_are_token_prefix_free(built):
+    out, _, _ = built
+    tok = get_tok()
+    choice_sets = [
+        item["choices"]
+        for name in ("recognition.jsonl", "internal.jsonl")
+        for item in _read_jsonl(out / "eval" / name)
+    ]
+    choice_sets.extend(
+        item["meta"]["answer_choices"]
+        for name in ("original.jsonl", "counterfactual.jsonl", "factual.jsonl")
+        for item in _read_jsonl(out / "eval" / name)
+    )
+
+    for choices in choice_sets:
+        encoded = [tuple(tok.encode(choice)) for choice in choices]
+        assert all(encoded)
+        assert len(set(encoded)) == len(encoded)
+        assert all(
+            not (
+                len(left) < len(right)
+                and right[: len(left)] == left
+            )
+            for left in encoded
+            for right in encoded
+            if left != right
+        )
+
+
+def test_evaluator_produces_guardrails_consumed_by_analysis(built):
+    from scripts.analyze_relational import analyze_runs, expected_run_keys
+    from scripts.run_relational_evals import produce_guardrail_measurements
+    from train.model import GPT, GPTConfig
+
+    out, _, _ = built
+    torch.manual_seed(5)
+    model = GPT(
+        GPTConfig(n_layer=1, n_head=1, d_model=32, ctx=1024)
+    ).eval()
+    tok = get_tok()
+    produced = {
+        condition: produce_guardrail_measurements(
+            model,
+            tok,
+            out,
+            condition=condition,
+            device="cpu",
+            batch_size=4,
+        )
+        for condition in ("dense", "split", "random")
+    }
+
+    assert all(
+        set(value)
+        == {
+            "within_run_guardrails",
+            "recognition_store_off",
+            "factual_recall",
+            "internal_accuracy",
+            "language",
+        }
+        for value in produced.values()
+    )
+    assert produced["split"]["within_run_guardrails"]["mask"]["passed"]
+    assert produced["dense"]["within_run_guardrails"]["mask"]["passed"]
+    assert not produced["dense"]["within_run_guardrails"]["mask"][
+        "external_mask_applicable"
+    ]
+    assert produced["random"]["within_run_guardrails"]["mask"]["passed"]
+    assert set(produced["split"]["internal_accuracy"]["per_kind"]) == {
+        "rule",
+        "central_fact",
+    }
+
+    def mode_summary(mode, score):
+        return {
+            "memory": mode,
+            "tasks": {
+                task: {
+                    "counterfactual_pair_accuracy": score,
+                    "n_pairs": 10_000,
+                }
+                for task in (
+                    "path_composition",
+                    "date_ordering",
+                    "balanced_equality",
+                )
+            },
+            "primary_composite": score,
+        }
+
+    runs = {}
+    for key in expected_run_keys():
+        _, condition, _, _ = key
+        runs[key] = {
+            "on": mode_summary("on", 0.5),
+            "off": mode_summary("off", 0.5),
+            "guardrails": produced[condition],
+        }
+
+    result = analyze_runs(runs)
+    assert result["run_count"] == 21
+    assert result["verdict"] in {
+        "invalid",
+        "validated",
+        "rejected",
+        "inconclusive",
+    }
+
+
+def test_guardrail_producer_raises_on_missing_committed_artifact(
+    built,
+    tmp_path,
+):
+    from scripts.run_relational_evals import produce_guardrail_measurements
+    from train.model import GPT, GPTConfig
+
+    out, _, _ = built
+    copied = tmp_path / "incomplete"
+    shutil.copytree(out, copied)
+    (copied / "eval" / "recognition.jsonl").unlink()
+    model = GPT(
+        GPTConfig(n_layer=1, n_head=1, d_model=16, ctx=1024)
+    ).eval()
+
+    with pytest.raises(FileNotFoundError, match="recognition.jsonl"):
+        produce_guardrail_measurements(
+            model,
+            get_tok(),
+            copied,
+            condition="dense",
+            device="cpu",
+            batch_size=4,
+        )
 
 
 def test_eval_validator_rejects_a_nonflipping_twin(built, tmp_path):
@@ -416,6 +620,33 @@ def test_eval_validator_rejects_a_nonflipping_twin(built, tmp_path):
     )
 
     with pytest.raises(ValueError, match="answers must flip"):
+        relational.validate_eval_sets(
+            cfg,
+            training_graph,
+            copied / "graph.jsonl",
+            copied / "original.jsonl",
+            copied / "counterfactual.jsonl",
+        )
+
+
+def test_eval_validator_rejects_missing_explicit_gold_actions(
+    built,
+    tmp_path,
+):
+    out, cfg, _ = built
+    copied = tmp_path / "eval-gold-copy"
+    copied.mkdir()
+    for name in ("graph.jsonl", "original.jsonl", "counterfactual.jsonl"):
+        shutil.copy(out / "eval" / name, copied / name)
+    training_graph = tmp_path / "graph.jsonl"
+    shutil.copy(out / "graph.jsonl", training_graph)
+    originals = _read_jsonl(copied / "original.jsonl")
+    del originals[0]["meta"]["gold_actions"]
+    (copied / "original.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in originals)
+    )
+
+    with pytest.raises(ValueError, match="gold actions"):
         relational.validate_eval_sets(
             cfg,
             training_graph,
@@ -476,3 +707,5 @@ def test_corpus_command_runs_as_a_repo_relative_script():
 
     assert completed.returncode == 0, completed.stderr
     assert "--bed-jsonl" in completed.stdout
+    assert "--guardrail-items" in completed.stdout
+    assert "--shared-text-eval-count" in completed.stdout

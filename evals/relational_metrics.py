@@ -476,6 +476,8 @@ def _paired_accuracy_guardrail(
         "dense": dense_accuracy,
         "threshold": -0.02,
         "comparison": ">=",
+        "test": "one-sided noninferiority",
+        "rule": "split >= dense - 0.02",
         "passed": delta >= -0.02 - _TOLERANCE,
         "n": min(split_n, dense_n),
         "n_split": split_n,
@@ -487,6 +489,8 @@ def factual_job_guardrail(
     split_memory_on: Mapping,
     dense_memory_off: Mapping,
 ) -> dict:
+    """One-sided noninferiority: Split ON may trail Dense OFF by at most .02."""
+
     return _paired_accuracy_guardrail(
         split_memory_on, dense_memory_off, "factual recall"
     )
@@ -496,6 +500,8 @@ def internal_knowledge_guardrail(
     split_internal: Mapping,
     dense_internal: Mapping,
 ) -> dict:
+    """One-sided noninferiority: Split may trail Dense by at most .02."""
+
     return _paired_accuracy_guardrail(
         split_internal, dense_internal, "internal knowledge"
     )
@@ -591,7 +597,9 @@ def route_guardrails(audit: Mapping) -> dict[str, dict]:
     }
 
 
-def mask_ledger_guardrail(audit: Mapping) -> dict:
+def mask_ledger_guardrail(audit: Mapping, *, condition: str) -> dict:
+    if condition not in ("dense", "split", "random"):
+        raise ValueError(f"unexpected training condition: {condition}")
     unmasked = audit["unmasked_external_payloads"]
     external_total = audit["external_payload_occurrences"]
     masked_protected = audit["masked_rule_action_answer_targets"]
@@ -608,9 +616,14 @@ def mask_ledger_guardrail(audit: Mapping) -> dict:
         raise ValueError("mask ledger denominators must be positive")
     if unmasked > external_total or masked_protected > protected_total:
         raise ValueError("mask ledger violations exceed audited occurrences")
-    violations = unmasked + masked_protected
+    external_mask_applicable = condition == "split"
+    violations = masked_protected + (
+        unmasked if external_mask_applicable else 0
+    )
     return {
         "value": violations,
+        "condition": condition,
+        "external_mask_applicable": external_mask_applicable,
         "unmasked_external_payloads": unmasked,
         "masked_rule_action_answer_targets": masked_protected,
         "threshold": 0,

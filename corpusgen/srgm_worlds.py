@@ -309,10 +309,40 @@ def _item(
     variant: str,
     entity_slots: tuple[int | None, ...],
     gold_facts: tuple[GraphFact, ...],
+    source_slots: tuple[int, ...],
     answer_choices: tuple[str, ...],
     changed_row: GraphRow | None = None,
     relations: tuple[str, ...] = (),
 ) -> QAItem:
+    if len(source_slots) != len(gold_facts):
+        raise ValueError("source_slots must align with gold facts")
+    read_actions = [
+        GraphAction(
+            source_slot=source_slot,
+            relation_id=fact.row.relation_id,
+            direction=fact.row.direction,
+            read=True,
+            halt=False,
+        )
+        for source_slot, fact in zip(source_slots, gold_facts)
+    ]
+    halt = GraphAction(0, "r0", "out", read=False, halt=True)
+    noop = GraphAction(0, "r0", "out", read=False, halt=False)
+    gold_actions = [
+        *read_actions,
+        halt,
+        *[noop for _ in range(5 - len(read_actions))],
+    ]
+
+    def action_json(action: GraphAction) -> dict:
+        return {
+            "source_slot": action.source_slot,
+            "relation_id": action.relation_id,
+            "direction": action.direction,
+            "read": action.read,
+            "halt": action.halt,
+        }
+
     return QAItem(
         qid=qid,
         task=task,
@@ -336,6 +366,9 @@ def _item(
                 for fact in gold_facts
             ],
             "gold_fact_ids": [fact.fact_id for fact in gold_facts],
+            "gold_actions": [
+                action_json(action) for action in gold_actions
+            ],
             "answer_choices": list(answer_choices),
             "relations": list(relations),
         },
@@ -522,6 +555,7 @@ def _generate_eval_pairs(
                     )
 
                 gold_facts = used
+                source_slots = (0,) * len(gold_facts)
                 entity_slots = (a, None, None, None)
                 answer_choices = tuple(f"r{i}" for i in range(4))
                 prompt = (
@@ -556,6 +590,7 @@ def _generate_eval_pairs(
                     else "<|slot_1|>"
                 )
                 gold_facts = (fact_a, fact_b)
+                source_slots = (0, 1)
                 entity_slots = (a, b, None, None)
                 answer_choices = ("<|slot_0|>", "<|slot_1|>")
                 prompt = (
@@ -587,6 +622,7 @@ def _generate_eval_pairs(
                     else "no"
                 )
                 gold_facts = (fact_a, fact_b)
+                source_slots = (0, 1)
                 entity_slots = (a, b, None, None)
                 answer_choices = ("yes", "no")
                 prompt = (
@@ -610,6 +646,7 @@ def _generate_eval_pairs(
                 variant="original",
                 entity_slots=entity_slots,
                 gold_facts=gold_facts,
+                source_slots=source_slots,
                 answer_choices=answer_choices,
                 relations=relations,
             )
@@ -623,6 +660,7 @@ def _generate_eval_pairs(
                 variant="counterfactual",
                 entity_slots=entity_slots,
                 gold_facts=gold_facts,
+                source_slots=source_slots,
                 answer_choices=answer_choices,
                 changed_row=changed,
                 relations=relations,
@@ -649,6 +687,45 @@ def generate_eval_pairs(
         seed,
         path_hops=None,
     )
+
+
+def make_factual_recall_item(
+    world: GraphWorld,
+    fact: GraphFact,
+    ordinal: int,
+) -> QAItem:
+    if ordinal < 0:
+        raise ValueError("factual item ordinal must be non-negative")
+    if fact.row.target_kind != "entity":
+        raise ValueError("factual recall items require entity facts")
+    qualifiers = dict(fact.row.qualifiers)
+    if "compose" not in qualifiers:
+        raise ValueError("factual recall entity facts require compose codes")
+    entity_ids = _entity_ids(world)
+    names = dict(zip(entity_ids, world.entity_names))
+    if fact.row.source_id not in names:
+        raise ValueError("factual source is absent from its world")
+    qid = f"factual-{world.world_id}-{fact.fact_id}-{ordinal}"
+    item = _item(
+        qid=qid,
+        task="factual_recall",
+        prompt=(
+            f"Slot 0 refers to {names[fact.row.source_id]}. "
+            f"Start at slot 0 and follow {fact.row.relation_id}. "
+            "Return the composed relation."
+        ),
+        answer=f"r{int(qualifiers['compose']) % 4}",
+        pair_id=qid,
+        graph_rows=len(world.facts),
+        variant="original",
+        entity_slots=(fact.row.source_id, None, None, None),
+        gold_facts=(fact,),
+        source_slots=(0,),
+        answer_choices=tuple(f"r{index}" for index in range(4)),
+        relations=(fact.row.relation_id,),
+    )
+    item.meta["route"] = "external"
+    return item
 
 
 def iter_bed_records(bed_iter: Iterable[str]) -> Iterator[RenderedRecord]:
