@@ -413,6 +413,75 @@ def test_standalone_evaluator_loads_builder_produced_raw_eval_items(built):
     assert all(not hasattr(item, "correct") for item in items)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("unexpected", "task set mismatch"),
+        ("missing", "task set mismatch"),
+        ("misstratified", "expected 8 rows"),
+    ],
+)
+def test_standalone_evaluator_rejects_observed_task_stratum_violations(
+    built,
+    tmp_path,
+    mutation,
+    message,
+):
+    from scripts.run_relational_evals import _load_eval_items
+
+    out, cfg, _ = built
+    copied = tmp_path / mutation
+    eval_dir = copied / "eval"
+    eval_dir.mkdir(parents=True)
+    originals = _read_jsonl(out / "eval" / "original.jsonl")
+    counterfactuals = _read_jsonl(
+        out / "eval" / "counterfactual.jsonl"
+    )
+
+    if mutation == "unexpected":
+        for rows, variant in (
+            (originals, "original"),
+            (counterfactuals, "counterfactual"),
+        ):
+            extra = json.loads(json.dumps(rows[0]))
+            extra["qid"] = f"unexpected-0-{variant}"
+            extra["task"] = "unexpected_task"
+            extra["meta"]["pair_id"] = "unexpected-0"
+            extra["meta"]["variant"] = variant
+            rows.append(extra)
+    elif mutation == "missing":
+        originals = [
+            row for row in originals if row["task"] != "date_ordering"
+        ]
+        counterfactuals = [
+            row
+            for row in counterfactuals
+            if row["task"] != "date_ordering"
+        ]
+    else:
+        source_task = counterfactuals[0]["task"]
+        counterfactuals[0]["task"] = next(
+            task
+            for task in (
+                "path_composition",
+                "date_ordering",
+                "balanced_equality",
+            )
+            if task != source_task
+        )
+
+    for name, rows in (
+        ("original.jsonl", originals),
+        ("counterfactual.jsonl", counterfactuals),
+    ):
+        (eval_dir / name).write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+
+    with pytest.raises(ValueError, match=message):
+        _load_eval_items(copied, cfg.eval_pairs_per_task)
+
+
 def test_builder_commits_all_guardrail_eval_inputs(built):
     out, cfg, report = built
     recognition = _read_jsonl(out / "eval" / "recognition.jsonl")

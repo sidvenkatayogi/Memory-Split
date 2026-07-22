@@ -57,6 +57,14 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _group_rows_by_task(rows) -> dict[str, list]:
+    grouped: dict[str, list] = {}
+    for row in rows:
+        task = str(row["task"] if isinstance(row, dict) else row.task)
+        grouped.setdefault(task, []).append(row)
+    return grouped
+
+
 def _load_eval_items(data_dir: Path, expected_pairs: int) -> list[QAItem]:
     originals = [
         QAItem(**row)
@@ -69,10 +77,7 @@ def _load_eval_items(data_dir: Path, expected_pairs: int) -> list[QAItem]:
         )
     ]
     items = originals + counterfactuals
-    rows_by_task = {
-        task: [item.__dict__ for item in items if item.task == task]
-        for task in EXPECTED_TASKS
-    }
+    rows_by_task = _group_rows_by_task(items)
     assert_expected_counts(rows_by_task, expected_pairs)
     return items
 
@@ -253,13 +258,12 @@ def _write_jsonl(path: Path, rows) -> None:
 
 
 def _summary(rows: list[dict], expected_pairs: int, memory: str) -> dict:
-    rows_by_task = {
-        task: [row for row in rows if row["task"] == task]
-        for task in EXPECTED_TASKS
-    }
+    rows_by_task = _group_rows_by_task(rows)
     assert_expected_counts(rows_by_task, expected_pairs)
-    task_summary = {
-        task: {
+    task_summary = {}
+    for task in EXPECTED_TASKS:
+        task_rows = rows_by_task[task]
+        task_summary[task] = {
             "counterfactual_pair_accuracy": counterfactual_pair_accuracy(
                 task_rows, expected_pairs=expected_pairs
             ),
@@ -268,8 +272,6 @@ def _summary(rows: list[dict], expected_pairs: int, memory: str) -> dict:
             "n_rows": len(task_rows),
             "n_pairs": expected_pairs,
         }
-        for task, task_rows in rows_by_task.items()
-    }
     composite = sum(
         task_summary[task]["counterfactual_pair_accuracy"]
         for task in EXPECTED_TASKS

@@ -32,14 +32,9 @@ def _result(pair_id, variant, correct, task="path_composition"):
     }
 
 
-def test_structure_validator_accepts_unscored_rows_and_rejects_duplicate_qids():
-    rows_by_task = {}
-    for task in (
-        "path_composition",
-        "date_ordering",
-        "balanced_equality",
-    ):
-        rows_by_task[task] = [
+def _unscored_rows_by_task(n_pairs=2):
+    return {
+        task: [
             {
                 key: value
                 for key, value in _result(
@@ -50,9 +45,19 @@ def test_structure_validator_accepts_unscored_rows_and_rejects_duplicate_qids():
                 ).items()
                 if key != "correct"
             }
-            for pair in range(2)
+            for pair in range(n_pairs)
             for variant in ("original", "counterfactual")
         ]
+        for task in (
+            "path_composition",
+            "date_ordering",
+            "balanced_equality",
+        )
+    }
+
+
+def test_structure_validator_accepts_unscored_rows_and_rejects_duplicate_qids():
+    rows_by_task = _unscored_rows_by_task()
 
     validate_eval_structure(rows_by_task, n_pairs=2)
     assert_expected_counts(rows_by_task, n_pairs=2)
@@ -61,6 +66,43 @@ def test_structure_validator_accepts_unscored_rows_and_rejects_duplicate_qids():
         "path_composition"
     ][0]["qid"]
     with pytest.raises(ValueError, match="duplicate eval qid"):
+        validate_eval_structure(rows_by_task, n_pairs=2)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("unexpected", "task set mismatch"),
+        ("missing", "task set mismatch"),
+        ("misstratified", "row task labels do not match stratum"),
+    ],
+)
+def test_structure_validator_rejects_task_stratum_violations(
+    mutation,
+    message,
+):
+    rows_by_task = _unscored_rows_by_task()
+    if mutation == "unexpected":
+        rows_by_task["unexpected_task"] = [
+            {
+                key: value
+                for key, value in _result(
+                    f"unexpected-{pair}",
+                    variant,
+                    True,
+                    "unexpected_task",
+                ).items()
+                if key != "correct"
+            }
+            for pair in range(2)
+            for variant in ("original", "counterfactual")
+        ]
+    elif mutation == "missing":
+        del rows_by_task["date_ordering"]
+    else:
+        rows_by_task["date_ordering"][0]["task"] = "path_composition"
+
+    with pytest.raises(ValueError, match=message):
         validate_eval_structure(rows_by_task, n_pairs=2)
 
 
@@ -109,6 +151,58 @@ def test_counterfactual_pair_accuracy_requires_scores_for_both_variants():
 
     with pytest.raises(ValueError, match="requires scored rows"):
         counterfactual_pair_accuracy(rows, expected_pairs=1)
+
+
+def _summary_result(pair_id, variant, task):
+    return {
+        **_result(pair_id, variant, True, task),
+        "actions": ["a"],
+        "gold_actions": ["a"],
+        "correct_referents": [True],
+        "misses": 0,
+        "malformed": 0,
+        "excess_reads": 0,
+        "halt_step": 2,
+        "n_steps": 6,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("unexpected", "task set mismatch"),
+        ("missing", "task set mismatch"),
+        ("misstratified", "expected 4 rows"),
+    ],
+)
+def test_summary_validates_observed_task_strata(mutation, message):
+    from scripts.run_relational_evals import _summary
+
+    rows = [
+        _summary_result(f"{task}-{pair}", variant, task)
+        for task in (
+            "path_composition",
+            "date_ordering",
+            "balanced_equality",
+        )
+        for pair in range(2)
+        for variant in ("original", "counterfactual")
+    ]
+    if mutation == "unexpected":
+        rows.append(
+            _summary_result(
+                "unexpected-0",
+                "original",
+                "unexpected_task",
+            )
+        )
+    elif mutation == "missing":
+        rows = [row for row in rows if row["task"] != "date_ordering"]
+    else:
+        rows[0]["task"] = "date_ordering"
+
+    with pytest.raises(ValueError, match=message):
+        _summary(rows, expected_pairs=2, memory="on")
 
 
 def test_expected_counts_are_exact_per_frozen_stratum():
