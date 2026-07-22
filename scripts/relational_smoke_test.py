@@ -18,11 +18,10 @@ from corpusgen.relational_build import (
     RelationalBuildConfig,
     build_relational_corpus,
 )
-from corpusgen.records import QAItem
 from evals.relational_generate import decode_items
-from evals.relational_metrics import EXPECTED_TASKS
 from organizer.graph_store import AtomicGraphStore
 from scripts.run_relational_evals import (
+    _load_eval_items,
     _states_to_rows,
     _summary,
     _write_jsonl,
@@ -136,40 +135,16 @@ def _resume_is_exact(trainer: Trainer, root: Path) -> bool:
     return torch.equal(expected_loss, resumed_loss)
 
 
-def _load_smoke_items(corpus: Path) -> list[QAItem]:
-    items = []
-    for name in ("original.jsonl", "counterfactual.jsonl"):
-        items.extend(
-            QAItem(**json.loads(line))
-            for line in (corpus / "eval" / name).read_text().splitlines()
-            if line.strip()
-        )
-    expected_pairs = SMOKE_FIXTURE["eval_pairs_per_task"]
-    for task in EXPECTED_TASKS:
-        task_items = [item for item in items if item.task == task]
-        pairs: dict[str, set[str]] = {}
-        for item in task_items:
-            pair_id = str(item.meta["pair_id"])
-            pairs.setdefault(pair_id, set()).add(str(item.meta["variant"]))
-        if (
-            len(task_items) != 2 * expected_pairs
-            or len(pairs) != expected_pairs
-            or any(
-                variants != {"original", "counterfactual"}
-                for variants in pairs.values()
-            )
-        ):
-            raise ValueError(f"incomplete smoke eval pairs for {task}")
-    return items
-
-
 def _evaluate_modes(
     root: Path,
     corpus: Path,
     trainer: Trainer,
     tok,
 ) -> list[str]:
-    items = _load_smoke_items(corpus)
+    items = _load_eval_items(
+        corpus,
+        SMOKE_FIXTURE["eval_pairs_per_task"],
+    )
     base_store = AtomicGraphStore.load(corpus / "eval" / "graph.jsonl")
     modes = []
     trainer.model.eval()

@@ -53,6 +53,66 @@ def _row_variant(row) -> str:
     return variant
 
 
+def validate_eval_structure(
+    rows_by_task: Mapping[str, Sequence],
+    n_pairs: int | None = EXPECTED_PAIRS_PER_TASK,
+    *,
+    expected_tasks: Sequence[str] = EXPECTED_TASKS,
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Validate paired eval structure without requiring scored outcomes."""
+
+    if n_pairs is not None and n_pairs <= 0:
+        raise ValueError("n_pairs must be positive")
+    expected_tasks = tuple(expected_tasks)
+    actual_tasks = set(rows_by_task)
+    expected_task_set = set(expected_tasks)
+    if actual_tasks != expected_task_set:
+        raise ValueError(
+            "task set mismatch; "
+            f"missing={sorted(expected_task_set - actual_tasks)}, "
+            f"extra={sorted(actual_tasks - expected_task_set)}"
+        )
+
+    grouped_by_task = {}
+    seen_qids = set()
+    required = {"original", "counterfactual"}
+    for task in expected_tasks:
+        rows = list(rows_by_task[task])
+        if n_pairs is not None and len(rows) != 2 * n_pairs:
+            raise ValueError(
+                f"{task}: expected {2 * n_pairs} rows for expected "
+                f"{n_pairs} pairs, got {len(rows)}"
+            )
+        if any(str(_field(row, "task")) != task for row in rows):
+            raise ValueError(f"{task}: row task labels do not match stratum")
+
+        grouped: dict[str, dict[str, object]] = defaultdict(dict)
+        for row in rows:
+            pair_id = _row_pair_id(row)
+            variant = _row_variant(row)
+            qid = str(_field(row, "qid"))
+            if variant in grouped[pair_id]:
+                raise ValueError(
+                    "every pair requires distinct original and "
+                    "counterfactual variants"
+                )
+            if qid in seen_qids:
+                raise ValueError(f"duplicate eval qid: {qid}")
+            seen_qids.add(qid)
+            grouped[pair_id][variant] = row
+
+        if any(set(pair) != required for pair in grouped.values()):
+            raise ValueError(
+                "every pair requires original and counterfactual variants"
+            )
+        if n_pairs is not None and len(grouped) != n_pairs:
+            raise ValueError(
+                f"{task}: expected {n_pairs} pairs, got {len(grouped)}"
+            )
+        grouped_by_task[task] = dict(grouped)
+    return grouped_by_task
+
+
 def counterfactual_pair_accuracy(
     rows,
     *,
@@ -64,34 +124,32 @@ def counterfactual_pair_accuracy(
     if expected_pairs is not None and expected_pairs <= 0:
         raise ValueError("expected_pairs must be positive")
 
-    grouped: dict[str, dict[str, Mapping]] = defaultdict(dict)
-    seen_qids = set()
-    for row in materialized:
-        pair_id = _row_pair_id(row)
-        variant = _row_variant(row)
-        qid = str(_field(row, "qid"))
-        if variant in grouped[pair_id]:
-            raise ValueError(
-                "every pair requires distinct original and counterfactual variants"
+    tasks = {str(_field(row, "task")) for row in materialized}
+    if len(tasks) != 1:
+        raise ValueError(
+            "counterfactual accuracy rows must share exactly one task"
+        )
+    task = tasks.pop()
+    grouped = validate_eval_structure(
+        {task: materialized},
+        n_pairs=expected_pairs,
+        expected_tasks=(task,),
+    )[task]
+    try:
+        scored_pairs = [
+            (
+                bool(_field(pair["original"], "correct")),
+                bool(_field(pair["counterfactual"], "correct")),
             )
-        if qid in seen_qids:
-            raise ValueError(f"duplicate eval qid: {qid}")
-        seen_qids.add(qid)
-        grouped[pair_id][variant] = row
-
-    if expected_pairs is not None and len(grouped) != expected_pairs:
+            for pair in grouped.values()
+        ]
+    except (AttributeError, KeyError) as exc:
         raise ValueError(
-            f"expected {expected_pairs} pairs, got {len(grouped)}"
-        )
-    required = {"original", "counterfactual"}
-    if any(set(pair) != required for pair in grouped.values()):
-        raise ValueError(
-            "every pair requires original and counterfactual variants"
-        )
+            "counterfactual accuracy requires scored rows with 'correct'"
+        ) from exc
     successes = sum(
-        bool(_field(pair["original"], "correct"))
-        and bool(_field(pair["counterfactual"], "correct"))
-        for pair in grouped.values()
+        original and counterfactual
+        for original, counterfactual in scored_pairs
     )
     return successes / len(grouped)
 
@@ -100,26 +158,7 @@ def assert_expected_counts(
     rows_by_task: Mapping[str, Sequence],
     n_pairs: int = EXPECTED_PAIRS_PER_TASK,
 ) -> None:
-    if n_pairs <= 0:
-        raise ValueError("n_pairs must be positive")
-    actual_tasks = set(rows_by_task)
-    expected_tasks = set(EXPECTED_TASKS)
-    if actual_tasks != expected_tasks:
-        raise ValueError(
-            "task set mismatch; "
-            f"missing={sorted(expected_tasks - actual_tasks)}, "
-            f"extra={sorted(actual_tasks - expected_tasks)}"
-        )
-    expected_rows = 2 * n_pairs
-    for task in EXPECTED_TASKS:
-        rows = list(rows_by_task[task])
-        if len(rows) != expected_rows:
-            raise ValueError(
-                f"{task}: expected {expected_rows} rows, got {len(rows)}"
-            )
-        if any(str(_field(row, "task")) != task for row in rows):
-            raise ValueError(f"{task}: row task labels do not match stratum")
-        counterfactual_pair_accuracy(rows, expected_pairs=n_pairs)
+    validate_eval_structure(rows_by_task, n_pairs=n_pairs)
 
 
 def _nonnegative_int(row, name: str) -> int:

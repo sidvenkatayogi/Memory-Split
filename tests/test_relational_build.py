@@ -403,6 +403,16 @@ def test_graph_policy_eval_and_manifests_are_portable(built):
         assert _sha256(out / relative) == artifact["sha256"]
 
 
+def test_standalone_evaluator_loads_builder_produced_raw_eval_items(built):
+    from scripts.run_relational_evals import _load_eval_items
+
+    out, cfg, _ = built
+    items = _load_eval_items(out, cfg.eval_pairs_per_task)
+
+    assert len(items) == 6 * cfg.eval_pairs_per_task
+    assert all(not hasattr(item, "correct") for item in items)
+
+
 def test_builder_commits_all_guardrail_eval_inputs(built):
     out, cfg, report = built
     recognition = _read_jsonl(out / "eval" / "recognition.jsonl")

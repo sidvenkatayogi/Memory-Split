@@ -16,6 +16,7 @@ from evals.relational_metrics import (
     recognition_guardrails,
     route_guardrails,
     shared_text_bpb,
+    validate_eval_structure,
     wilson_interval,
 )
 
@@ -29,6 +30,38 @@ def _result(pair_id, variant, correct, task="path_composition"):
         "task": task,
         "correct": correct,
     }
+
+
+def test_structure_validator_accepts_unscored_rows_and_rejects_duplicate_qids():
+    rows_by_task = {}
+    for task in (
+        "path_composition",
+        "date_ordering",
+        "balanced_equality",
+    ):
+        rows_by_task[task] = [
+            {
+                key: value
+                for key, value in _result(
+                    f"{task}-{pair}",
+                    variant,
+                    True,
+                    task,
+                ).items()
+                if key != "correct"
+            }
+            for pair in range(2)
+            for variant in ("original", "counterfactual")
+        ]
+
+    validate_eval_structure(rows_by_task, n_pairs=2)
+    assert_expected_counts(rows_by_task, n_pairs=2)
+
+    rows_by_task["date_ordering"][0]["qid"] = rows_by_task[
+        "path_composition"
+    ][0]["qid"]
+    with pytest.raises(ValueError, match="duplicate eval qid"):
+        validate_eval_structure(rows_by_task, n_pairs=2)
 
 
 def test_counterfactual_pair_accuracy_requires_both_distinct_variants():
@@ -58,6 +91,24 @@ def test_counterfactual_pair_accuracy_rejects_missing_or_unexpected_counts():
     ]
     with pytest.raises(ValueError, match="expected 2 pairs"):
         counterfactual_pair_accuracy(complete, expected_pairs=2)
+
+
+def test_counterfactual_pair_accuracy_requires_scores_for_both_variants():
+    rows = [
+        _result("p0", "original", False),
+        {
+            key: value
+            for key, value in _result(
+                "p0",
+                "counterfactual",
+                True,
+            ).items()
+            if key != "correct"
+        },
+    ]
+
+    with pytest.raises(ValueError, match="requires scored rows"):
+        counterfactual_pair_accuracy(rows, expected_pairs=1)
 
 
 def test_expected_counts_are_exact_per_frozen_stratum():
