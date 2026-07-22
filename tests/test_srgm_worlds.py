@@ -85,16 +85,34 @@ def test_public_world_ids_have_disjoint_addresses():
 @pytest.mark.parametrize(
     ("n_entities", "expected"),
     [
+        (16, [16]),
+        (32, [32]),
+        (63, [63]),
         (65, [49, 16]),
         (70, [54, 16]),
         (127, [63, 64]),
+        (130, [64, 50, 16]),
     ],
 )
-def test_world_stream_never_emits_undersized_tail(n_entities, expected):
+def test_world_stream_preserves_population_without_undersized_tail(
+    n_entities,
+    expected,
+):
     worlds = list(iter_worlds(n_entities, world_size=64, seed=11))
+    source_ids_by_world = [
+        {fact.row.source_id for fact in world.facts}
+        for world in worlds
+    ]
+
     assert [len(world.entity_names) for world in worlds] == expected
     assert sum(len(world.entity_names) for world in worlds) == n_entities
     assert all(len(world.entity_names) >= 16 for world in worlds)
+    assert set().union(*source_ids_by_world) == set(range(n_entities))
+    assert all(
+        source_ids.isdisjoint(other_ids)
+        for index, source_ids in enumerate(source_ids_by_world)
+        for other_ids in source_ids_by_world[index + 1 :]
+    )
 
 
 def test_world_stream_rejects_totals_below_reasoning_minimum_immediately():

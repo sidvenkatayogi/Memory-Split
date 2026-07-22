@@ -206,6 +206,9 @@ def _iter_world_sizes(
     if remainder == 0:
         yield from (world_size for _ in range(full_worlds))
         return
+    if full_worlds == 0:
+        yield remainder
+        return
     if remainder >= MIN_REASONING_ENTITIES:
         yield from (world_size for _ in range(full_worlds - 1))
         combined = world_size + remainder
@@ -242,6 +245,7 @@ def iter_worlds(
         raise ValueError("world_id_offset must be non-negative")
 
     def worlds() -> Iterator[GraphWorld]:
+        entity_id_offset = world_id_offset * world_size
         for ordinal, size in enumerate(
             _iter_world_sizes(n_entities, world_size)
         ):
@@ -251,9 +255,10 @@ def iter_worlds(
                 WorldConfig(
                     n_entities=size,
                     seed=seed,
-                    entity_id_offset=world_id * world_size,
+                    entity_id_offset=entity_id_offset,
                 ),
             )
+            entity_id_offset += size
 
     return worlds()
 
