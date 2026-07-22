@@ -158,7 +158,11 @@ def test_discovery_uses_only_bounded_read_only_slurm_commands(tmp_path):
             "gres": "gpu:h100:4",
             "time_limit": "06:00:00",
             "nodes": 3,
+            "nodes_approximate": False,
+            "nodes_suffix": None,
             "memory_mb": 512000,
+            "memory_mb_approximate": False,
+            "memory_mb_suffix": None,
         },
         {
             "partition": "mit-long",
@@ -166,7 +170,11 @@ def test_discovery_uses_only_bounded_read_only_slurm_commands(tmp_path):
             "gres": "gpu:a100:8",
             "time_limit": "2-00:00:00",
             "nodes": 2,
+            "nodes_approximate": False,
+            "nodes_suffix": None,
             "memory_mb": 256000,
+            "memory_mb_approximate": False,
+            "memory_mb_suffix": None,
         },
     ]
     assert result["module"]["command"] == "/usr/bin/module"
@@ -193,6 +201,145 @@ def test_discovery_uses_only_bounded_read_only_slurm_commands(tmp_path):
         "bytes": len(b"frozen bundle"),
         "sha256": hashlib.sha256(b"frozen bundle").hexdigest(),
     }
+
+
+@pytest.mark.parametrize(
+    ("raw_nodes", "raw_memory", "expected"),
+    [
+        (
+            "2",
+            "512000+",
+            {
+                "nodes": 2,
+                "nodes_approximate": False,
+                "nodes_suffix": None,
+                "memory_mb": 512000,
+                "memory_mb_approximate": True,
+                "memory_mb_suffix": "+",
+            },
+        ),
+        (
+            "2*",
+            "512000",
+            {
+                "nodes": 2,
+                "nodes_approximate": True,
+                "nodes_suffix": "*",
+                "memory_mb": 512000,
+                "memory_mb_approximate": False,
+                "memory_mb_suffix": None,
+            },
+        ),
+        (
+            "2",
+            "512000",
+            {
+                "nodes": 2,
+                "nodes_approximate": False,
+                "nodes_suffix": None,
+                "memory_mb": 512000,
+                "memory_mb_approximate": False,
+                "memory_mb_suffix": None,
+            },
+        ),
+    ],
+)
+def test_discovery_parses_plain_and_approximate_capacity_fixtures(
+    raw_nodes,
+    raw_memory,
+    expected,
+):
+    probe = _import("cluster.mit.probe_cluster")
+    row = f"mit-gpu*|gpu:h100:4|06:00:00|{raw_nodes}|{raw_memory}\n"
+
+    partition = probe.parse_partitions(row)[0]
+
+    assert {
+        key: partition[key]
+        for key in (
+            "nodes",
+            "nodes_approximate",
+            "nodes_suffix",
+            "memory_mb",
+            "memory_mb_approximate",
+            "memory_mb_suffix",
+        )
+    } == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_nodes", "raw_memory"),
+    [
+        ("N/A", "512000"),
+        ("2nodes", "512000"),
+        ("2**", "512000"),
+        ("2", "N/A"),
+        ("2", "512000MB"),
+        ("2", "512000++"),
+    ],
+)
+def test_discovery_fails_loud_and_preserves_malformed_capacity_output(
+    tmp_path,
+    raw_nodes,
+    raw_memory,
+):
+    probe = _import("cluster.mit.probe_cluster")
+    raw = f"mit-gpu*|gpu:h100:4|06:00:00|{raw_nodes}|{raw_memory}\n"
+    responses = {
+        probe.COMMANDS[0]: SimpleNamespace(
+            returncode=0,
+            stdout="slurm 23.11.7\n",
+            stderr="",
+        ),
+        probe.COMMANDS[1]: SimpleNamespace(
+            returncode=0,
+            stdout=raw,
+            stderr="",
+        ),
+        probe.COMMANDS[2]: SimpleNamespace(
+            returncode=0,
+            stdout="ClusterName=student\n",
+            stderr="",
+        ),
+    }
+
+    result = probe.collect_probe(
+        command_runner=lambda command, **kwargs: responses[tuple(command)],
+        environ={},
+        which=lambda command: None,
+        disk_usage=lambda path: SimpleNamespace(total=1, used=0, free=1),
+        path_exists=lambda path: False,
+        is_executable=lambda path: False,
+        git_revision_reader=lambda root: None,
+        source_root=tmp_path,
+        bundle=None,
+    )
+
+    command = result["commands"]["partitions"]
+    assert command["ok"] is False
+    assert command["stdout"] == raw
+    assert "capacity" in command["error"]
+    assert result["slurm"]["partitions"] == []
+    assert result["slurm"]["partition_parse_error"] == command["error"]
+
+
+def test_discovery_help_explains_approximate_capacity_suffixes(capsys):
+    probe = _import("cluster.mit.probe_cluster")
+
+    with pytest.raises(SystemExit) as caught:
+        probe.main(["--help"])
+
+    assert caught.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "trailing '+' or '*'" in help_text
+    assert "approximate" in help_text
+
+
+def test_mit_runbook_explains_approximate_capacity_suffixes():
+    text = (REPO_ROOT / "cluster" / "RELATIONAL-RUNBOOK.md").read_text()
+
+    assert "trailing `+` or `*`" in text
+    assert "approximate" in text
 
 
 def test_discovery_attempts_every_command_and_records_bounded_failures(tmp_path):

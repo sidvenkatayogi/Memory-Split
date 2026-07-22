@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ COMMAND_NAMES = ("slurm_version", "partitions", "config")
 COMMAND_TIMEOUT_SECONDS = 10
 MAX_OUTPUT_CHARS = 1_048_576
 SCRATCH_ENVIRONMENT = ("SCRATCH", "SLURM_TMPDIR", "TMPDIR", "HOME")
+_CAPACITY_RE = re.compile(r"^(?P<value>[0-9]+)(?P<suffix>[+*]?)$")
 
 
 def _bounded_text(value: object) -> str:
@@ -76,6 +78,27 @@ def _run_command(
         }
 
 
+def _parse_capacity(
+    raw: str,
+    *,
+    field: str,
+    line_number: int,
+) -> tuple[int, str | None]:
+    match = _CAPACITY_RE.fullmatch(raw)
+    if match is None:
+        prefix = re.match(r"^[0-9]+", raw)
+        reason = (
+            "has no numeric prefix"
+            if prefix is None
+            else f"has unexpected trailing text {raw[prefix.end():]!r}"
+        )
+        raise ValueError(
+            f"partition row {line_number} {field} capacity {raw!r} {reason}"
+        )
+    suffix = match.group("suffix") or None
+    return int(match.group("value")), suffix
+
+
 def parse_partitions(text: str) -> list[dict]:
     """Parse the exact delimiter format requested by ``COMMANDS``."""
 
@@ -93,17 +116,16 @@ def parse_partitions(text: str) -> list[dict]:
         partition = raw_partition[:-1] if default else raw_partition
         if not partition:
             raise ValueError(f"partition row {line_number} has no name")
-        try:
-            nodes = int(raw_nodes)
-            memory_mb = int(raw_memory)
-        except ValueError as error:
-            raise ValueError(
-                f"partition row {line_number} has non-integer capacity"
-            ) from error
-        if nodes < 0 or memory_mb < 0:
-            raise ValueError(
-                f"partition row {line_number} has negative capacity"
-            )
+        nodes, nodes_suffix = _parse_capacity(
+            raw_nodes,
+            field="node",
+            line_number=line_number,
+        )
+        memory_mb, memory_suffix = _parse_capacity(
+            raw_memory,
+            field="memory",
+            line_number=line_number,
+        )
         partitions.append(
             {
                 "partition": partition,
@@ -111,7 +133,11 @@ def parse_partitions(text: str) -> list[dict]:
                 "gres": gres,
                 "time_limit": time_limit,
                 "nodes": nodes,
+                "nodes_approximate": nodes_suffix is not None,
+                "nodes_suffix": nodes_suffix,
                 "memory_mb": memory_mb,
+                "memory_mb_approximate": memory_suffix is not None,
+                "memory_mb_suffix": memory_suffix,
             }
         )
     return partitions
@@ -388,7 +414,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Record bounded read-only Slurm, filesystem, module, and Python facts."
-        )
+        ),
+        epilog=(
+            "A trailing '+' or '*' on sinfo %D/%m is retained and marks "
+            "the capacity approximate."
+        ),
     )
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-root", default=".")

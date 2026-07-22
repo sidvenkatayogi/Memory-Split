@@ -80,3 +80,21 @@ The full suite retains one pre-existing `dateutil` deprecation warning from
   reviewed profile, stage the bundle and corpora, and complete the real
   one-GPU 200-step preflight before any full launch.
 - Hardware throughput is reported rather than gated, as required.
+
+## Real-cluster discovery robustness addendum
+
+`sinfo` `%D` and `%m` capacities now accept a decimal value followed by at
+most one `+` or `*`. Structured partition evidence keeps the parsed integer,
+the exact suffix, and a per-field `approximate` boolean. Plain integers retain
+`suffix: null` and `approximate: false`. Values without a numeric prefix or
+with any other trailing text fail the partition probe while preserving its raw
+stdout and parse error.
+
+TDD fixtures cover `512000+`, `2*`, plain integers, missing numeric prefixes,
+text suffixes, and repeated suffixes. The initial targeted run had six expected
+failures for missing suffix metadata/help; all six malformed-value preservation
+fixtures already passed. The focused MIT discovery/bundle suite passed:
+`76 passed in 9.68s`. Discovery CLI help and the MIT runbook now explain
+approximate capacities. No launcher, profile, preflight, training,
+configuration, or scientific behavior changed, and no real cluster command or
+submission was run.

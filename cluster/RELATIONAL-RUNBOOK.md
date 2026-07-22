@@ -162,7 +162,8 @@ python cluster/mit/probe_cluster.py \
 This runs only `sinfo --version`, the fixed partition-format `sinfo` query, and
 `scontrol show config`. It also records local module, Python, scratch,
 filesystem, source-revision, and optional bundle-hash facts. It never allocates
-a node or submits a job.
+a node or submits a job. A trailing `+` or `*` on `%D` or `%m` is retained in
+structured evidence and marks that capacity approximate.
 
 Copy `cluster/mit/profile.example.json` to a reviewed, committed profile and
 fill it from one discovered option. The closed schema is
