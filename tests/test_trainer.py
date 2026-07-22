@@ -1,7 +1,9 @@
 import json
 
 import numpy as np
+import torch
 
+from train.model import GPT
 from train.trainer import Trainer, cosine_lr
 
 
@@ -69,6 +71,42 @@ def test_checkpoint_resume_exact_batches(tmp_path):
     xb, _ = b.data.next_batch()
     xa, _ = a.data.next_batch()
     assert (xa == xb).all()
+
+
+def test_weighted_training_uses_existing_gpt_and_sidecar(tmp_path):
+    bp, _ = write_corpus(tmp_path, n=1000)
+    weights_path = tmp_path / "train.weights.bin"
+    np.zeros(1000, dtype=np.uint8).tofile(weights_path)
+    cfg = base_cfg(tmp_path, bp, None)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 2,
+                "n_head": 2,
+                "d_model": 64,
+                "ctx": 64,
+                "vocab_size": 256,
+            },
+            "micro_batch_size": 2,
+            "tokens_per_step": 2 * 64,
+            "max_steps": 1,
+            "train_weights": str(weights_path),
+        }
+    )
+    trainer = Trainer(cfg)
+    assert type(trainer.model) is GPT
+    assert trainer.data.target_weights is not None
+    assert trainer.train_steps(1) == 0.0
+    checkpoint = torch.load(trainer.ckpt_path, weights_only=False)
+    assert set(checkpoint) == {
+        "model",
+        "opt",
+        "data",
+        "step",
+        "rng_torch",
+        "rng_cuda",
+        "cfg",
+    }
 
 
 def test_cosine_schedule():

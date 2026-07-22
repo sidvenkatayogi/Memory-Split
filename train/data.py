@@ -1,4 +1,4 @@
-"""Packed-sequence dataloader over uint16 token shards + uint8 loss-mask shards.
+"""Packed-sequence dataloader over token, loss-mask, and target-weight shards.
 
 The corpus builder writes, per arm, a flat stream of token ids (uint16) and
 a parallel loss mask (uint8, 1 = loss ON). Batches are contiguous windows;
@@ -27,6 +27,7 @@ class PackedShards:
         device: str = "cpu",
         start_cursor: int = 0,
         seed: int = 0,
+        weights_path: str | Path | None = None,
     ):
         self.tokens = np.memmap(bin_path, dtype=np.uint16, mode="r")
         if mask_path is not None and Path(mask_path).exists():
@@ -34,6 +35,13 @@ class PackedShards:
             assert len(self.mask) == len(self.tokens), "mask/token length mismatch"
         else:
             self.mask = None
+        if weights_path is not None:
+            self.target_weights = np.memmap(weights_path, dtype=np.uint8, mode="r")
+            assert len(self.target_weights) == len(
+                self.tokens
+            ), "weights/token length mismatch"
+        else:
+            self.target_weights = None
         self.ctx = ctx
         self.batch_size = batch_size
         self.device = device
@@ -68,6 +76,29 @@ class PackedShards:
             x = x.to(self.device)
             y = y.to(self.device)
         return x, y
+
+    def _aligned_next_token_weights_for_last_batch(self) -> torch.Tensor:
+        assert self.target_weights is not None
+        span = self.batch_size * (self.ctx + 1)
+        start = self.cursor - self.batch_size * self.ctx
+        raw = np.asarray(self.target_weights[start : start + span])
+        raw = raw.reshape(self.batch_size, self.ctx + 1)[:, 1:]
+        weights = torch.from_numpy(raw.astype(np.float32, copy=True))
+        if self.device == "cuda":
+            weights = weights.pin_memory().to(self.device, non_blocking=True)
+        elif self.device != "cpu":
+            weights = weights.to(self.device)
+        return weights
+
+    def next_weighted_batch(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x, targets = self.next_batch()
+        if self.target_weights is None:
+            weights = torch.ones_like(targets, dtype=torch.float32)
+        else:
+            weights = self._aligned_next_token_weights_for_last_batch()
+        return x, targets, weights
 
     def masked_value_batch(self, max_batches: int = 8) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Fixed probe batches over MASKED positions only (loss_masked_values metric).

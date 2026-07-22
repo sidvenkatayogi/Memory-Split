@@ -14,6 +14,13 @@ def make_shards(tmp_path, n=5000, masked_span=(100, 160)):
     return bp, mp
 
 
+def make_weights(tmp_path, n=5000):
+    weights = (np.arange(n) % 7).astype(np.uint8)
+    wp = tmp_path / "t.weights.bin"
+    weights.tofile(wp)
+    return wp, weights
+
+
 def test_batch_alignment_and_mask(tmp_path):
     bp, mp = make_shards(tmp_path)
     ds = PackedShards(bp, mp, ctx=32, batch_size=2, device="cpu")
@@ -46,6 +53,89 @@ def test_cursor_resume_exact(tmp_path):
     b.load_state_dict(state)
     xb, yb = b.next_batch()
     assert torch.equal(xa, xb) and torch.equal(ya, yb)
+
+
+def test_weighted_batch_aligns_weights_to_next_token(tmp_path):
+    bp, mp = make_shards(tmp_path)
+    wp, raw_weights = make_weights(tmp_path)
+    ds = PackedShards(
+        bp,
+        mp,
+        ctx=4,
+        batch_size=2,
+        device="cpu",
+        weights_path=wp,
+    )
+    _, _, weights = ds.next_weighted_batch()
+    expected = torch.from_numpy(
+        raw_weights[:10].reshape(2, 5)[:, 1:].astype(np.float32)
+    )
+    assert weights.dtype == torch.float32
+    assert torch.equal(weights, expected)
+
+
+def test_weighted_batch_without_sidecar_returns_ones(tmp_path):
+    bp, mp = make_shards(tmp_path)
+    ds = PackedShards(bp, mp, ctx=16, batch_size=2, device="cpu")
+    _, targets, weights = ds.next_weighted_batch()
+    assert weights.dtype == torch.float32
+    assert torch.equal(weights, torch.ones_like(targets, dtype=torch.float32))
+
+
+def test_weighted_cursor_resume_is_exact(tmp_path):
+    bp, mp = make_shards(tmp_path)
+    wp, _ = make_weights(tmp_path)
+    a = PackedShards(
+        bp,
+        mp,
+        ctx=16,
+        batch_size=2,
+        device="cpu",
+        weights_path=wp,
+    )
+    for _ in range(3):
+        a.next_weighted_batch()
+    state = a.state_dict()
+    batch_a = a.next_weighted_batch()
+    b = PackedShards(
+        bp,
+        mp,
+        ctx=16,
+        batch_size=2,
+        device="cpu",
+        weights_path=wp,
+    )
+    b.load_state_dict(state)
+    batch_b = b.next_weighted_batch()
+    assert all(torch.equal(a_item, b_item) for a_item, b_item in zip(batch_a, batch_b))
+
+
+def test_weighted_batch_wraps_sidecar_with_token_cursor(tmp_path):
+    bp, mp = make_shards(tmp_path, n=50)
+    wp, raw_weights = make_weights(tmp_path, n=50)
+    ds = PackedShards(
+        bp,
+        mp,
+        ctx=8,
+        batch_size=2,
+        device="cpu",
+        start_cursor=40,
+        weights_path=wp,
+    )
+    _, _, weights = ds.next_weighted_batch()
+    expected = torch.from_numpy(
+        raw_weights[:18].reshape(2, 9)[:, 1:].astype(np.float32)
+    )
+    assert ds.epoch == 1
+    assert torch.equal(weights, expected)
+
+
+def test_legacy_batch_tuple_and_positional_constructor_are_unchanged(tmp_path):
+    bp, mp = make_shards(tmp_path)
+    ds = PackedShards(bp, mp, 16, 2, "cpu", 0, 0)
+    batch = ds.next_batch()
+    assert isinstance(batch, tuple)
+    assert len(batch) == 2
 
 
 def test_wraparound_epoch(tmp_path):

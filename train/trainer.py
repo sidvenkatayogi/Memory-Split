@@ -66,6 +66,7 @@ class Trainer:
             batch_size=self.micro_bs,
             device=self.device,
             seed=cfg["seed"],
+            weights_path=cfg.get("train_weights"),
         )
         self.max_steps = cfg.get("max_steps") or int(
             cfg["total_tokens"] // cfg["tokens_per_step"]
@@ -188,9 +189,14 @@ class Trainer:
             self.opt.zero_grad(set_to_none=True)
             micro_losses = []
             for _ in range(self.accum):
-                x, y = self.data.next_batch()
-                with self._autocast():
-                    _, loss = self.model(x, y)
+                if self.cfg.get("train_weights"):
+                    x, y, weights = self.data.next_weighted_batch()
+                    with self._autocast():
+                        _, loss = self.model(x, y, target_weights=weights)
+                else:
+                    x, y = self.data.next_batch()
+                    with self._autocast():
+                        _, loss = self.model(x, y)
                 (loss / self.accum).backward()
                 micro_losses.append(loss.item())
                 tokens_seen += x.numel()
