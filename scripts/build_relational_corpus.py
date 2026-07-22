@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+"""Build one relational token stream and three aligned target-weight files."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from corpusgen.relational_build import (
+    RelationalBuildConfig,
+    build_relational_corpus,
+)
+from train.tokenizer import get_tok
+
+
+def iter_bed_jsonl(path: Path | str):
+    path = Path(path)
+    while True:
+        saw_text = False
+        with path.open() as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                text = row.get("text") if isinstance(row, dict) else None
+                if not isinstance(text, str) or not text:
+                    raise ValueError(
+                        f"{path}:{line_number} requires a non-empty text field"
+                    )
+                saw_text = True
+                yield text
+        if not saw_text:
+            raise ValueError(f"{path} contains no natural-text records")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build a shared relational corpus with dense, split, and "
+            "matched-random target weights."
+        )
+    )
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--entities", type=int, required=True)
+    parser.add_argument("--tokens", type=int, required=True)
+    parser.add_argument("--data-seed", type=int, required=True)
+    parser.add_argument("--bed-jsonl", required=True)
+    parser.add_argument("--world-size", type=int, default=64)
+    parser.add_argument("--eval-pairs-per-task", type=int, default=10_000)
+    parser.add_argument("--eval-pairs-per-world", type=int, default=32)
+    args = parser.parse_args(argv)
+
+    cfg = RelationalBuildConfig(
+        n_entities=args.entities,
+        total_tokens=args.tokens,
+        data_seed=args.data_seed,
+        world_size=args.world_size,
+        eval_pairs_per_task=args.eval_pairs_per_task,
+        eval_pairs_per_world=args.eval_pairs_per_world,
+    )
+    report = build_relational_corpus(
+        cfg,
+        get_tok(),
+        iter_bed_jsonl(args.bed_jsonl),
+        Path(args.out),
+    )
+    print(json.dumps(report["checks"], sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
