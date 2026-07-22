@@ -42,20 +42,3 @@ export PYTHONPATH=.
 The smoke test builds a toy corpus (500 entities), trains dense and split
 toy models for a few hundred steps, and asserts the mechanism: split-arm
 loss on masked fact values stays near-uniform while dense bio loss falls.
-
-## Cluster (FarmShare)
-
-```bash
-bash cluster/connect.sh <sunetid>            # warm SSH control socket (Duo)
-bash cluster/sync_push.sh                    # rsync repo to /scratch/users/$USER/memorysplit
-ssh <sunetid>@rice-04.farmshare.stanford.edu
-cd /scratch/users/$USER/memorysplit
-bash cluster/setup_env.sh                    # venv + torch cu13 + deps
-sbatch cluster/slurm/data_prep.sbatch        # FineWeb-Edu download + corpus build
-python scripts/make_manifest.py --stage sweep   # emits run manifest
-bash cluster/submit_manifest.sh outputs/manifests/sweep.tsv
-```
-
-Runs checkpoint every 30 min and are requeue-safe (2-day MaxWall). Gate
-runs, the preregistration freeze, and the kill order are specified in the
-design spec §7.
