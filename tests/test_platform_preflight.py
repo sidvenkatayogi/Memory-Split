@@ -9,6 +9,8 @@ import tarfile
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from scripts.make_relational_manifest import (
     ROUTE_POLICY_SHA256,
     make_jobs,
@@ -273,6 +275,43 @@ def _aws_probe(module, **changes):
     }
     values.update(changes)
     return module.FixtureProbe(**values)
+
+
+def test_aws_resume_gate_accepts_inexact_loss_within_tolerance(tmp_path):
+    module = _preflight_module()
+    resume = module.ResumeInfo(
+        steps=200,
+        exact=False,
+        next_loss_delta=1e-7,
+    )
+
+    detail = module._resume_detail(
+        _aws_probe(module, resume=resume),
+        platform="aws",
+        runs_root=tmp_path,
+    )
+
+    assert detail == {
+        "steps": 200,
+        "exact": False,
+        "next_loss_delta": 1e-7,
+    }
+
+
+def test_aws_resume_gate_rejects_loss_above_tolerance(tmp_path):
+    module = _preflight_module()
+    resume = module.ResumeInfo(
+        steps=200,
+        exact=True,
+        next_loss_delta=1.0001e-5,
+    )
+
+    with pytest.raises(ValueError, match="1e-5"):
+        module._resume_detail(
+            _aws_probe(module, resume=resume),
+            platform="aws",
+            runs_root=tmp_path,
+        )
 
 
 def test_local_preflight_validates_a_real_task5_bundle(tmp_path):

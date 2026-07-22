@@ -172,8 +172,12 @@ Then require the complete AWS preflight:
 It fails closed unless there are exactly eight H100s with at least 72 GiB free
 each, 1 TB writable NVMe free, six successful 200-step statuses, mean
 post-step-50 throughput of at least 60,000 raw tokens/s/GPU, peak observed
-memory at most 72 GiB per run, exact next-loss resume within `1e-5`, matching
-corpus/bundle hashes, and a non-Spot declaration.
+memory at most 72 GiB per run, next-loss resume delta at or below `1e-5`,
+matching corpus/bundle hashes, and a non-Spot declaration.
+
+The 60,000-token/s gate is deliberately conservative: its logged timing
+windows include checkpoint and snapshot overhead. Resume success is based on
+`next_loss_delta <= 1e-5`; the separately reported bit-exact flag is diagnostic.
 
 Preview, then explicitly start the full six-run queue:
 

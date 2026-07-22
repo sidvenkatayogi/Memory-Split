@@ -49,6 +49,19 @@ _RUNTIME_PATH_KEYS = {
 }
 
 
+class FarmshareSubmissionError(RuntimeError):
+    """All failed sbatch calls after every independent config was attempted."""
+
+    def __init__(self, failures: Sequence[Mapping]):
+        self.failures = tuple(dict(failure) for failure in failures)
+        super().__init__(
+            json.dumps(
+                {"failed_submissions": list(self.failures)},
+                sort_keys=True,
+            )
+        )
+
+
 def _portable_relative(value: str | os.PathLike[str], *, label: str) -> str:
     text = os.fspath(value)
     if (
@@ -341,17 +354,36 @@ def submit_farmshare(
     plan = farmshare_plan(manifest)
     if not execute:
         return plan
+    failures = []
     for command in plan:
-        result = run_command(command)
-        returncode = (
-            result
-            if isinstance(result, int)
-            else getattr(result, "returncode", None)
-        )
-        if returncode != 0:
-            raise RuntimeError(
-                f"FarmShare submission failed ({returncode}): {command}"
+        config_rel = command[1].split("CONFIG_REL=", 1)[1]
+        try:
+            result = run_command(command)
+            returncode = (
+                result
+                if isinstance(result, int)
+                else getattr(result, "returncode", None)
             )
+        except Exception as error:
+            failures.append(
+                {
+                    "command": list(command),
+                    "config_rel": config_rel,
+                    "error": f"{type(error).__name__}: {error}",
+                    "returncode": None,
+                }
+            )
+            continue
+        if returncode != 0:
+            failures.append(
+                {
+                    "command": list(command),
+                    "config_rel": config_rel,
+                    "returncode": returncode,
+                }
+            )
+    if failures:
+        raise FarmshareSubmissionError(failures)
     return plan
 
 
@@ -439,7 +471,11 @@ def main(argv: list[str] | None = None) -> int:
         print(output)
         return 0
 
-    plan = submit_farmshare(args.manifest, execute=args.execute)
+    try:
+        plan = submit_farmshare(args.manifest, execute=args.execute)
+    except FarmshareSubmissionError as error:
+        print(error, file=sys.stderr)
+        return 1
     _print_plan(plan)
     if not args.execute:
         print("dry-run; pass --execute to submit jobs", file=sys.stderr)

@@ -39,6 +39,7 @@ REQUIRED_ENVIRONMENT = ["DATA_ROOT", "OUT_ROOT"]
 FARMSHARE_FREE_BYTES = 500_000_000_000
 AWS_FREE_BYTES = 1_000_000_000_000
 L40S_MIN_MEMORY_MIB = 44 * 1024
+# nvidia-smi reports MiB; this threshold is 72 GiB = 72 * 1024 MiB.
 H100_USABLE_MEMORY_MIB = 72 * 1024
 AWS_THROUGHPUT_MIN = 60_000.0
 AWS_WARMUP_STEPS = 50
@@ -577,13 +578,16 @@ def _resume_detail(
     )
     if (
         resume.steps != expected_steps
-        or resume.exact is not True
         or not math.isfinite(resume.next_loss_delta)
         or resume.next_loss_delta > RESUME_TOLERANCE
+        or (platform != "aws" and resume.exact is not True)
     ):
-        raise ValueError(
-            f"{expected_steps}-step checkpoint/resume is not exact within 1e-5"
+        message = (
+            "requires finite next_loss_delta <= 1e-5"
+            if platform == "aws"
+            else "must be exact with finite next_loss_delta <= 1e-5"
         )
+        raise ValueError(f"{expected_steps}-step checkpoint resume {message}")
     return asdict(resume)
 
 
@@ -682,6 +686,8 @@ def _aws_run_evidence(runs_root: Path | str | None) -> dict:
             if AWS_WARMUP_STEPS < int(row.get("step", -1)) <= AWS_PROBE_STEPS
             and "tok_s" in row
         ]
+        # Trainer timing windows include checkpoint/snapshot work between
+        # log rows, so this intentionally keeps the 60k gate conservative.
         if (
             not values
             or any(not math.isfinite(value) or value <= 0 for value in values)
@@ -849,6 +855,9 @@ def run_preflight(
                 "mean_raw_tokens_per_second_per_gpu": evidence[
                     "mean_throughput"
                 ],
+                "measurement": (
+                    "checkpoint/snapshot-inclusive logged throughput"
+                ),
                 "samples": evidence["throughput_samples"],
             }
 

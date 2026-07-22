@@ -302,6 +302,38 @@ def test_farmshare_execute_submits_one_job_per_config(tmp_path):
     assert len({call[1] for call in calls}) == 15
 
 
+def test_farmshare_submitter_attempts_all_after_injected_failures(tmp_path):
+    module = _manifest_module()
+    written = module.write_manifests(tmp_path)
+    calls = []
+    failure_codes = {1: 17, 12: 23}
+
+    def fake_submit(command):
+        index = len(calls)
+        calls.append(command)
+        return failure_codes.get(index, 0)
+
+    with pytest.raises(module.FarmshareSubmissionError) as caught:
+        module.submit_farmshare(
+            written["160m"]["manifest"],
+            execute=True,
+            run_command=fake_submit,
+        )
+
+    assert len(calls) == 15
+    assert calls[-1][1].endswith("d160m_random_n800k_s2.yaml")
+    assert [
+        (failure["config_rel"], failure["returncode"])
+        for failure in caught.value.failures
+    ] == [
+        (
+            calls[index][1].split("CONFIG_REL=", 1)[1],
+            returncode,
+        )
+        for index, returncode in failure_codes.items()
+    ]
+
+
 def test_aws_dry_run_does_not_start_processes_or_write_outputs(tmp_path):
     manifest_module = _manifest_module()
     launcher = _aws_module()
