@@ -24,12 +24,31 @@ import tiktoken
 
 from corpusgen.records import Segment
 
-SPECIAL_TOKENS = {
+DB_SPECIAL_TOKENS = {
     "<|db_start|>": 50257,
     "<|db_retrieve|>": 50258,
     "<|db_end|>": 50259,
     "<|eot|>": 50260,
 }
+GRAPH_SPECIAL_TOKENS = {
+    "<|graph_start|>": 50261,
+    "<|graph_read|>": 50262,
+    "<|graph_return|>": 50263,
+    "<|graph_end|>": 50264,
+    "<|graph_halt|>": 50265,
+    "<|graph_noop|>": 50266,
+    "<|slot_0|>": 50267,
+    "<|slot_1|>": 50268,
+    "<|slot_2|>": 50269,
+    "<|slot_3|>": 50270,
+    "<|dir_out|>": 50271,
+    "<|dir_in|>": 50272,
+    "<|graph_step|>": 50273,
+    "<|answer_state|>": 50274,
+    "<|graph_miss|>": 50275,
+    **{f"<|rel_{i}|>": 50276 + i for i in range(16)},
+}
+SPECIAL_TOKENS = {**DB_SPECIAL_TOKENS, **GRAPH_SPECIAL_TOKENS}
 
 VOCAB_SIZE = 50304
 
@@ -45,10 +64,26 @@ class Tok:
             mergeable_ranks=base._mergeable_ranks,
             special_tokens={**base._special_tokens, **SPECIAL_TOKENS},
         )
-        self.DB_START = SPECIAL_TOKENS["<|db_start|>"]
-        self.DB_RETRIEVE = SPECIAL_TOKENS["<|db_retrieve|>"]
-        self.DB_END = SPECIAL_TOKENS["<|db_end|>"]
-        self.EOT = SPECIAL_TOKENS["<|eot|>"]
+        self.DB_START = DB_SPECIAL_TOKENS["<|db_start|>"]
+        self.DB_RETRIEVE = DB_SPECIAL_TOKENS["<|db_retrieve|>"]
+        self.DB_END = DB_SPECIAL_TOKENS["<|db_end|>"]
+        self.EOT = DB_SPECIAL_TOKENS["<|eot|>"]
+        self.graph_special_tokens = dict(GRAPH_SPECIAL_TOKENS)
+        self.GRAPH_START = GRAPH_SPECIAL_TOKENS["<|graph_start|>"]
+        self.GRAPH_READ = GRAPH_SPECIAL_TOKENS["<|graph_read|>"]
+        self.GRAPH_RETURN = GRAPH_SPECIAL_TOKENS["<|graph_return|>"]
+        self.GRAPH_END = GRAPH_SPECIAL_TOKENS["<|graph_end|>"]
+        self.GRAPH_HALT = GRAPH_SPECIAL_TOKENS["<|graph_halt|>"]
+        self.GRAPH_NOOP = GRAPH_SPECIAL_TOKENS["<|graph_noop|>"]
+        self.GRAPH_STEP = GRAPH_SPECIAL_TOKENS["<|graph_step|>"]
+        self.ANSWER_STATE = GRAPH_SPECIAL_TOKENS["<|answer_state|>"]
+        self.GRAPH_MISS = GRAPH_SPECIAL_TOKENS["<|graph_miss|>"]
+        self.DIR_OUT = GRAPH_SPECIAL_TOKENS["<|dir_out|>"]
+        self.DIR_IN = GRAPH_SPECIAL_TOKENS["<|dir_in|>"]
+        self.SLOTS = tuple(GRAPH_SPECIAL_TOKENS[f"<|slot_{i}|>"] for i in range(4))
+        self.RELATIONS = {
+            f"r{i}": GRAPH_SPECIAL_TOKENS[f"<|rel_{i}|>"] for i in range(16)
+        }
 
     def encode(self, text: str) -> list[int]:
         return self._enc.encode(text, allowed_special="all")
@@ -70,6 +105,17 @@ class Tok:
             ids.append(self.EOT)
             mask.append(1)
         return ids, mask
+
+    def encode_tagged_segments(self, segments):
+        ids: list[int] = []
+        roles: list[str] = []
+        fact_ids: list[str | None] = []
+        for segment in segments:
+            segment_ids = self._enc.encode(segment.text, allowed_special="all")
+            ids.extend(segment_ids)
+            roles.extend([segment.role] * len(segment_ids))
+            fact_ids.extend([segment.fact_id] * len(segment_ids))
+        return ids, roles, fact_ids
 
 
 _TOK: Tok | None = None

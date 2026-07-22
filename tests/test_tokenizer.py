@@ -51,3 +51,13 @@ def test_dense_rendering_fully_unmasked():
     segs = [plain("Kai Nakamura majored in Communications at Stanford University.")]
     ids, mask = tok.encode_segments(segs)
     assert all(m == 1 for m in mask)
+
+
+def test_graph_special_token_ids_are_reserved_and_atomic():
+    tok = get_tok()
+    assert tok.GRAPH_START == 50261
+    assert tok.GRAPH_MISS == 50275
+    assert tok.RELATIONS["r0"] == 50276
+    assert tok.RELATIONS["r15"] == 50291
+    for text, token_id in tok.graph_special_tokens.items():
+        assert tok.encode(text) == [token_id]
