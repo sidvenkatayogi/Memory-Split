@@ -15,6 +15,10 @@ from scripts.package_relational_run import main, package_run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_COUNTS = {"160m": 15, "360m": 6}
+TOKENIZER_ASSETS = {
+    "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
+    "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
+}
 
 
 def _portable_inputs(tmp_path):
@@ -83,6 +87,7 @@ def test_bundle_is_deterministic_relative_and_hash_complete(tmp_path):
         "source-revision.txt",
         "route-policy.json",
         "fixtures/relational-smoke.json",
+        "tests/fixtures/relational-smoke-route-policy.json",
         "configs/160m.tsv",
         "configs/360m.tsv",
         "scripts/relational_smoke_test.py",
@@ -90,6 +95,7 @@ def test_bundle_is_deterministic_relative_and_hash_complete(tmp_path):
         "evals/relational_generate.py",
         "tests/test_relational_smoke.py",
         "tests/test_relational_bundle.py",
+        *TOKENIZER_ASSETS,
     } <= names
     assert sum(name.startswith("configs/160m/run-") for name in names) == 15
     assert sum(name.startswith("configs/360m/run-") for name in names) == 6
@@ -121,6 +127,7 @@ def test_bundle_is_deterministic_relative_and_hash_complete(tmp_path):
     }
     indexed = {item["path"]: item for item in manifest["members"]}
     assert set(indexed) == names - {"manifest.json"}
+    assert TOKENIZER_ASSETS <= set(indexed)
     for name, item in indexed.items():
         assert item["bytes"] == len(files[name])
         assert item["sha256"] == hashlib.sha256(files[name]).hexdigest()

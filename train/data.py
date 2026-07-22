@@ -1,9 +1,10 @@
 """Packed-sequence dataloader over token, loss-mask, and target-weight shards.
 
-The corpus builder writes, per arm, a flat stream of token ids (uint16) and
-a parallel loss mask (uint8, 1 = loss ON). Batches are contiguous windows;
-the target at position t is token t+1, and its label is -100 wherever the
-NEXT token's mask is 0 (fact values in the split arm).
+Legacy corpora may pair the flat uint16 token stream with a binary uint8 loss
+mask (1 = loss ON). Relational corpora instead use per-arm target-weight
+sidecars and normally omit the legacy mask. Batches are contiguous windows;
+when a legacy mask is present, the target at position t is token t+1 and its
+label is -100 wherever the NEXT token's mask is 0.
 
 The cursor is a single integer (token offset), saved into checkpoints so a
 resumed run continues on the exact next batch.
@@ -101,11 +102,12 @@ class PackedShards:
         return x, targets, weights
 
     def masked_value_batch(self, max_batches: int = 8) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Fixed probe batches over MASKED positions only (loss_masked_values metric).
+        """Probe positions excluded by an optional legacy binary loss mask.
 
         Returns (x, y) where y is -100 everywhere EXCEPT masked-value targets —
         the complement of the training labels — sampled from the shard head.
-        None when the corpus has no masked positions (dense arm).
+        Returns None for target-weight-only relational corpora and for legacy
+        corpora with no masked positions.
         """
         if self.mask is None:
             return None

@@ -24,9 +24,39 @@ from corpusgen.relational_build import (
     build_relational_corpus,
     calibrate_write_cost,
     derive_weights,
+    load_route_policy,
 )
 from corpusgen.graph_records import RenderedRecord, ScheduleEntry, TaggedSegment
 from train.tokenizer import get_tok
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+POLICY_SHA256 = (
+    "0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058"
+)
+
+
+@pytest.fixture(scope="session")
+def route_policy_fixture(tmp_path_factory):
+    path = tmp_path_factory.mktemp("route-policy") / "fixture-policy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "policy": {
+                    "hop_cost": 0.25,
+                    "read_cost": 0.25,
+                    "write_cost": 1.0,
+                },
+                "policy_sha256": POLICY_SHA256,
+                "calibration": {"source": "explicit test fixture"},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return path
 
 
 def test_write_cost_is_selected_without_semantic_labels():
@@ -216,7 +246,7 @@ def _bed_stream():
 
 
 @pytest.fixture(scope="module")
-def built(tmp_path_factory):
+def built(tmp_path_factory, route_policy_fixture):
     out = tmp_path_factory.mktemp("relational-corpus")
     cfg = RelationalBuildConfig(
         n_entities=64,
@@ -227,7 +257,14 @@ def built(tmp_path_factory):
         guardrail_items=8,
         shared_text_eval_count=4,
     )
-    report = build_relational_corpus(cfg, get_tok(), _bed_stream(), out)
+    report = build_relational_corpus(
+        cfg,
+        get_tok(),
+        _bed_stream(),
+        out,
+        route_policy_path=route_policy_fixture,
+        expected_policy_sha256=POLICY_SHA256,
+    )
     return out, cfg, report
 
 
@@ -360,7 +397,10 @@ def test_mask_ledger_proves_coverage_and_matched_random_histogram(built):
     assert np.array_equal(random_control == 0, selected_random_positions)
 
 
-def test_graph_policy_eval_and_manifests_are_portable(built):
+def test_graph_policy_eval_and_manifests_are_portable(
+    built,
+    route_policy_fixture,
+):
     out, cfg, _ = built
     graph = _read_jsonl(out / "graph.jsonl")
     policy = json.loads((out / "route-policy.json").read_text())
@@ -371,7 +411,10 @@ def test_graph_policy_eval_and_manifests_are_portable(built):
     eval_graph = _read_jsonl(out / "eval" / "graph.jsonl")
 
     assert len(graph) == cfg.n_entities * 6
-    assert 0.40 <= policy["calibration"]["route_rate"] <= 0.60
+    assert (out / "route-policy.json").read_bytes() == (
+        route_policy_fixture.read_bytes()
+    )
+    assert policy["policy_sha256"] == POLICY_SHA256
     policy_text = json.dumps(policy, sort_keys=True)
     for forbidden in ("audit_class", "answer", "target", "task", "outcome"):
         assert forbidden not in policy_text
@@ -735,10 +778,21 @@ def test_eval_validator_rejects_missing_explicit_gold_actions(
         )
 
 
-def test_same_seed_rebuild_has_identical_artifact_hashes(built, tmp_path):
+def test_same_seed_rebuild_has_identical_artifact_hashes(
+    built,
+    tmp_path,
+    route_policy_fixture,
+):
     first_out, cfg, _ = built
     second_out = tmp_path / "rerun"
-    build_relational_corpus(cfg, get_tok(), _bed_stream(), second_out)
+    build_relational_corpus(
+        cfg,
+        get_tok(),
+        _bed_stream(),
+        second_out,
+        route_policy_path=route_policy_fixture,
+        expected_policy_sha256=POLICY_SHA256,
+    )
 
     first = json.loads((first_out / "manifest.json").read_text())
     second = json.loads((second_out / "manifest.json").read_text())
@@ -751,6 +805,60 @@ def test_same_seed_rebuild_has_identical_artifact_hashes(built, tmp_path):
         for artifact in second["artifacts"]
     }
     assert first_hashes == second_hashes
+
+
+def test_all_frozen_seeds_and_loads_use_the_committed_policy_hash():
+    from scripts.make_relational_manifest import make_jobs
+
+    jobs = [
+        job
+        for scale in ("160m", "360m")
+        for job in make_jobs(scale)
+    ]
+    expected_hashes = {job["route_policy_sha256"] for job in jobs}
+    assert expected_hashes == {POLICY_SHA256}
+
+    policy_path = REPO_ROOT / "configs" / "route-policy.json"
+    loaded_hashes = {
+        load_route_policy(
+            policy_path,
+            expected_policy_sha256=job["route_policy_sha256"],
+        )[0].sha256()
+        for job in jobs
+    }
+    assert loaded_hashes == {POLICY_SHA256}
+
+
+def test_policy_hash_mismatch_fails_before_any_corpus_work(
+    tmp_path,
+    route_policy_fixture,
+):
+    cfg = RelationalBuildConfig(
+        n_entities=16,
+        total_tokens=1,
+        data_seed=0,
+        world_size=16,
+        eval_pairs_per_task=1,
+        guardrail_items=1,
+        shared_text_eval_count=1,
+    )
+    out = tmp_path / "must-not-exist"
+
+    def forbidden_bed_stream():
+        raise AssertionError("corpus work started before policy validation")
+        yield
+
+    with pytest.raises(ValueError, match="expected route policy SHA-256"):
+        build_relational_corpus(
+            cfg,
+            get_tok(),
+            forbidden_bed_stream(),
+            out,
+            route_policy_path=route_policy_fixture,
+            expected_policy_sha256="0" * 64,
+        )
+
+    assert not out.exists()
 
 
 def test_bed_jsonl_stream_rewinds_deterministically(tmp_path):
@@ -772,19 +880,46 @@ def test_bed_jsonl_stream_rewinds_deterministically(tmp_path):
 
 
 def test_corpus_command_runs_as_a_repo_relative_script():
-    repo = Path(__file__).resolve().parents[1]
     completed = subprocess.run(
         [
             sys.executable,
             "scripts/build_relational_corpus.py",
             "--help",
         ],
-        cwd=repo,
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
     )
 
     assert completed.returncode == 0, completed.stderr
     assert "--bed-jsonl" in completed.stdout
+    assert "--route-policy" in completed.stdout
+    assert "--route-policy-sha256" in completed.stdout
     assert "--guardrail-items" in completed.stdout
     assert "--shared-text-eval-count" in completed.stdout
+
+
+def test_corpus_command_requires_policy_path_and_expected_hash():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_relational_corpus.py",
+            "--out",
+            "unused",
+            "--entities",
+            "16",
+            "--tokens",
+            "1",
+            "--data-seed",
+            "0",
+            "--bed-jsonl",
+            "unused.jsonl",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "--route-policy" in completed.stderr
+    assert "--route-policy-sha256" in completed.stderr

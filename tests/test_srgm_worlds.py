@@ -45,6 +45,24 @@ def _answer_from_evidence(world, pair, item):
     raise AssertionError(f"unexpected task: {item.task}")
 
 
+def _path_cursor_oracle(world, pair, item):
+    """Traverse from slot 0 using relations, never stored gold addresses."""
+
+    rows = _rows_by_address(world)
+    if item.meta["variant"] == "counterfactual":
+        rows[pair.changed_row.address] = pair.changed_row
+    cursor = int(item.meta["entity_slots"][0])
+    addresses = []
+    compose = 0
+    for relation in item.meta["relations"]:
+        address = GraphAddress(cursor, relation, "out")
+        row = rows[address]
+        addresses.append(address)
+        compose = (compose + int(dict(row.qualifiers)["compose"])) % 4
+        cursor = int(row.target)
+    return addresses, f"r{compose}"
+
+
 def test_world_has_six_unique_functional_facts_per_entity():
     world = generate_world(0, WorldConfig(n_entities=64, seed=7))
     by_source = defaultdict(list)
@@ -176,6 +194,35 @@ def test_counterfactual_pairs_change_supporting_evidence_and_replay_to_flip():
         assert pair.changed_row.address == changed_original.address
         assert pair.changed_row != changed_original
         assert pair.changed_row.provenance_id == changed_original.provenance_id
+
+
+def test_independent_cursor_oracle_reconstructs_every_path_without_gold_addresses():
+    world = generate_world(0, WorldConfig(n_entities=64, seed=7))
+    pairs = [
+        pair
+        for pair in generate_eval_pairs(world, n_pairs_per_task=20, seed=17)
+        if pair.task == "path_composition"
+    ]
+
+    for pair in pairs:
+        for item in (pair.original, pair.counterfactual):
+            derived_addresses, derived_answer = _path_cursor_oracle(
+                world,
+                pair,
+                item,
+            )
+            stored_addresses = [
+                GraphAddress(int(source), relation, direction)
+                for source, relation, direction in item.meta["gold_addresses"]
+            ]
+            assert derived_addresses == stored_addresses
+            assert derived_answer == item.answer
+
+            item.meta["gold_addresses"] = [[2**63, "r15", "in"]]
+            assert _path_cursor_oracle(world, pair, item) == (
+                derived_addresses,
+                derived_answer,
+            )
 
 
 def test_eval_items_persist_exact_six_step_gold_actions():

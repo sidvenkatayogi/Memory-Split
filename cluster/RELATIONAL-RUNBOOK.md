@@ -29,6 +29,11 @@ The smoke report must have two Dense steps, two Split steps, both memory modes,
 complete pairs, a shared stream, and exact resume. Build the real Task 5 bundle
 only from a clean tree:
 
+The tiny smoke uses the committed explicit policy fixture in
+`tests/fixtures/relational-smoke-route-policy.json`; it does not recalibrate.
+That fixture only keeps the 32-entity smoke evaluable and is not valid for a
+protected corpus. Protected builds must use `configs/route-policy.json`.
+
 ```bash
 .venv/bin/python scripts/package_relational_run.py \
   --out artifacts/relational-run.tar.gz
@@ -41,7 +46,10 @@ Packaging uses the checked-in 15-run and 6-run manifests, the frozen
 `configs/route-policy.json`, and
 `outputs/relational-smoke/smoke-report.json`. Local preflight validates every
 archive member hash, every source/config byte, the exact matrices, the policy
-hash, dependencies, and the real smoke report.
+hash, dependencies, and the real smoke report. The bundle `manifest.json`
+indexes both tracked GPT-2 tokenizer cache blobs under `vendor/tiktoken/` with
+their byte counts and SHA-256 hashes. Tokenizer startup uses only those
+vendored assets; packaging and preflight must not fetch or require network.
 
 Stop if any local command exits nonzero.
 
@@ -78,18 +86,31 @@ Stage the pinned FineWeb-Edu JSONL and build six 160M corpora: loads `n50k` and
   --entities 50000 \
   --tokens 1599602688 \
   --data-seed 10000 \
-  --bed-jsonl "$DATA_ROOT/fineweb-edu.jsonl"
+  --bed-jsonl "$DATA_ROOT/fineweb-edu.jsonl" \
+  --route-policy configs/route-policy.json \
+  --route-policy-sha256 \
+    0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058
 ```
 
 Repeat with the exact directory, entity count, and data seed named by each
 config. Do not copy one seed's corpus under another name. Retain each corpus
 `manifest.json`, route-policy, report, graph, sidecars, and eval data.
+Every build must read the same committed policy file and pass the
+`route_policy_sha256` frozen in its run config. Never recalibrate policy by
+load or data seed; a policy mismatch must stop before any corpus output is
+created. Apply the same policy arguments when building the three `n1p8m`
+corpora for the 360M runs.
 
 Run FarmShare preflight inside a one-L40S Slurm allocation so the GPU check is
 real. It also requires Slurm commands, 500 GB writable free space, all relevant
 corpus hashes, a 40–60% route rate, at least 80% tail externalization, at least
 80% rule/top-centrality internalization, the frozen policy hash, and exact
 two-step checkpoint/resume:
+
+Route-audit accounting treats each graph fact as one route-rate unit. For the
+`rules_top_centrality` internalization stratum, each top-centrality fact is one
+unit and each generated world contributes one additional always-internal rule
+unit. That rule unit is per world, not per emitted rule training record.
 
 ```bash
 "$RELATIONAL_VENV/bin/python" scripts/platform_preflight.py \
@@ -132,6 +153,11 @@ AWS is preferred only for the six 360M confirmation runs. Use one
 `p5.48xlarge` with exactly eight visible H100 80 GB GPUs. Use On-Demand or an
 EC2 Capacity Block; never use Spot for these protected runs. This runbook does
 not provision or contact AWS.
+
+The eight-GPU requirement is intentionally fixed even though the queue has six
+jobs: it freezes the `p5.48xlarge` platform topology rather than adapting to
+available hardware. Launcher and preflight therefore fail closed for any
+count other than eight unique visible GPUs.
 
 Stage the three `n1p8m` corpora for data seeds 10000–10002 on local NVMe. Each
 uses 1,800,000 entities and 3,599,761,408 raw tokens. Set:
@@ -215,6 +241,13 @@ After all 21 protected runs are evaluated:
 The analyzer requires the exact frozen matrix. A missing seed-2 run is never
 substituted with another seed, a duplicate, a lower scale, or a rerun chosen
 after inspecting outcomes. Report an incomplete matrix as pending.
+
+The 360M validation margin is `max(0.02, 2 * pooled_sigma)`.
+`pooled_sigma` is estimated only from the paired 160M Split-minus-Dense
+effects: three seeds at `n50k` and three seeds at `n800k`, pooled within load
+with four total degrees of freedom. It is a preregistered 160M seed-noise scale
+applied to the 360M confirmation mean, not a variance estimate from the 360M
+runs themselves.
 
 Synchronize checkpoints, logs, runtime configs, eval summaries, corpus
 manifests, the bundle SHA-256, and `aws-launch-status.json` to durable storage.

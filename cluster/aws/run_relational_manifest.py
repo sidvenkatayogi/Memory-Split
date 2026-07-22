@@ -26,6 +26,7 @@ from scripts.make_relational_manifest import (  # noqa: E402
 )
 
 
+# Frozen p5.48xlarge topology; do not resize this to the six-job queue.
 AWS_WORKERS = 8
 STATUS_NAME = "aws-launch-status.json"
 

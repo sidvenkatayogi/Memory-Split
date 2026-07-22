@@ -1,6 +1,6 @@
 """Training loop: AdamW + cosine, bf16 autocast (CUDA), grad accumulation,
 atomic checkpoint/resume (model+opt+data cursor+RNG), model-only snapshots,
-JSONL logging including the split-arm mechanism metric `loss_masked_values`.
+and optional legacy-mask `loss_masked_values` logging.
 """
 
 from __future__ import annotations
@@ -142,8 +142,11 @@ class Trainer:
 
     @torch.no_grad()
     def loss_masked_values(self) -> float | None:
-        """CE at loss-masked positions (fact values). The gate-0 mechanism
-        metric: stays high in the split arm, falls in the dense arm's bio text."""
+        """CE at targets excluded by an optional legacy binary loss mask.
+
+        Target-weight-only relational runs have no such mask, so this returns
+        None and is not a diagnostic of relational sidecar training.
+        """
         if self._probe is None:
             self._probe = self.data.masked_value_batch() or "none"
         if self._probe == "none":

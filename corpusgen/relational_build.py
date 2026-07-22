@@ -8,7 +8,6 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from itertools import zip_longest
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -46,9 +45,7 @@ _PROTECTED_TARGET_ROLES = {
     "final_answer",
 }
 _COMPONENT_ORDER = tuple(COMPONENT_SHARES)
-_ROUTE_WORLD_ID = 1 << 30
 _EVAL_WORLD_ID = 1 << 31
-_ROUTE_SEED_XOR = 0x5EED5EED
 _ROUTE_STATS_SEED_XOR = 0x13579BDF
 _EVAL_SEED_XOR = 0x0E1A15E7
 
@@ -111,6 +108,73 @@ class RoutePolicy:
     def sha256(self) -> str:
         value = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(value.encode()).hexdigest()
+
+
+def load_route_policy(
+    path: Path | str,
+    *,
+    expected_policy_sha256: str,
+) -> tuple[RoutePolicy, dict, bytes]:
+    """Load and authenticate one frozen route-policy document."""
+
+    policy_path = Path(path)
+    if not policy_path.is_file() or policy_path.is_symlink():
+        raise ValueError("route policy must be a regular non-symlink file")
+    if (
+        not isinstance(expected_policy_sha256, str)
+        or len(expected_policy_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_policy_sha256
+        )
+    ):
+        raise ValueError(
+            "expected route policy SHA-256 must be 64 lowercase hex characters"
+        )
+
+    raw = policy_path.read_bytes()
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("route policy must contain valid JSON") from error
+    required = {
+        "schema_version",
+        "policy",
+        "policy_sha256",
+        "calibration",
+    }
+    if not isinstance(document, dict) or set(document) != required:
+        raise ValueError("route policy fields do not match the frozen schema")
+    if document["schema_version"] != 1:
+        raise ValueError("route policy schema_version must be 1")
+    if not isinstance(document["calibration"], dict):
+        raise ValueError("route policy calibration metadata must be a mapping")
+
+    raw_policy = document["policy"]
+    policy_fields = {"write_cost", "read_cost", "hop_cost"}
+    if not isinstance(raw_policy, dict) or set(raw_policy) != policy_fields:
+        raise ValueError("route policy cost fields do not match the schema")
+    costs = {}
+    for name in policy_fields:
+        value = raw_policy[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"route policy {name} must be finite and non-negative")
+        costs[name] = float(value)
+
+    policy = RoutePolicy(**costs)
+    actual_sha256 = policy.sha256()
+    if document["policy_sha256"] != actual_sha256:
+        raise ValueError("route policy declared SHA-256 does not match its costs")
+    if actual_sha256 != expected_policy_sha256:
+        raise ValueError(
+            "expected route policy SHA-256 does not match the policy input"
+        )
+    return policy, document, raw
 
 
 def calibrate_write_cost(facts) -> RoutePolicy:
@@ -248,13 +312,6 @@ def _fact_costs_for_world(
             ),
         )
     return costs
-
-
-def _cost_digest(costs: Iterable[FactCost]) -> str:
-    payload = _canonical_json(
-        [asdict(cost) for cost in sorted(costs, key=lambda cost: cost.fact_id)]
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class _CostTrackingWorldFactory:
@@ -726,35 +783,6 @@ class SharedCorpusWriter:
 CorpusWriter = SharedCorpusWriter
 
 
-def _calibrate_policy(cfg: RelationalBuildConfig) -> tuple[RoutePolicy, dict]:
-    calibration_seed = cfg.data_seed ^ _ROUTE_SEED_XOR
-    stats_seed = calibration_seed ^ _ROUTE_STATS_SEED_XOR
-    world = generate_world(
-        _ROUTE_WORLD_ID,
-        WorldConfig(n_entities=cfg.world_size, seed=calibration_seed),
-    )
-    costs_by_id = _fact_costs_for_world(
-        world,
-        stats_seed=stats_seed,
-        pairs_per_task=cfg.route_stats_pairs_per_task,
-    )
-    costs = tuple(costs_by_id.values())
-    policy = calibrate_write_cost(costs)
-    calibration = {
-        "world_id": world.world_id,
-        "entities": len(world.entity_names),
-        "facts": len(costs),
-        "query_schedule_count_per_family": cfg.route_stats_pairs_per_task,
-        "route_rate": policy.route_rate(costs),
-        "fact_cost_sha256": _cost_digest(costs),
-        "inputs": (
-            "payload_entropy,scheduled_exposure_count,"
-            "expected_query_count,expected_hop_contribution"
-        ),
-    }
-    return policy, calibration
-
-
 def _payload_choice_text(row) -> str:
     return _canonical_json(
         {
@@ -1039,6 +1067,8 @@ def _write_training_graph(
                         "central_fact",
                     ) is not None:
                         central_sources.append((world, fact))
+            # Route-audit rules are one always-internal accounting unit per
+            # world, not one unit per emitted rule training record.
             structure_total += 1
             structure_internal += 1
 
@@ -1368,7 +1398,14 @@ def build_relational_corpus(
     tok,
     bed_iter,
     out_dir: Path | str,
+    *,
+    route_policy_path: Path | str,
+    expected_policy_sha256: str,
 ) -> dict:
+    policy, policy_document, policy_bytes = load_route_policy(
+        route_policy_path,
+        expected_policy_sha256=expected_policy_sha256,
+    )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_dir = out_dir / "eval"
@@ -1379,18 +1416,8 @@ def build_relational_corpus(
         cfg.shared_text_eval_count,
     )
 
-    policy, calibration = _calibrate_policy(cfg)
     policy_path = out_dir / "route-policy.json"
-    _write_json(
-        policy_path,
-        {
-            "schema_version": 1,
-            "policy": asdict(policy),
-            "policy_sha256": policy.sha256(),
-            "write_cost_grid": list(WRITE_COST_GRID),
-            "calibration": calibration,
-        },
-    )
+    policy_path.write_bytes(policy_bytes)
     policy_manifest_path = out_dir / "policy-manifest.json"
     _write_json(
         policy_manifest_path,
@@ -1710,7 +1737,7 @@ def build_relational_corpus(
         "policy": {
             **asdict(policy),
             "sha256": policy.sha256(),
-            "calibration_route_rate": calibration["route_rate"],
+            "calibration": policy_document["calibration"],
             "protected_route_rate": graph_manifest["route_rate"],
         },
         "tokens": {

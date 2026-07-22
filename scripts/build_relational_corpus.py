@@ -50,6 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tokens", type=int, required=True)
     parser.add_argument("--data-seed", type=int, required=True)
     parser.add_argument("--bed-jsonl", required=True)
+    parser.add_argument("--route-policy", required=True)
+    parser.add_argument("--route-policy-sha256", required=True)
     parser.add_argument("--world-size", type=int, default=64)
     parser.add_argument("--eval-pairs-per-task", type=int, default=10_000)
     parser.add_argument("--eval-pairs-per-world", type=int, default=32)
@@ -72,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         get_tok(),
         iter_bed_jsonl(args.bed_jsonl),
         Path(args.out),
+        route_policy_path=args.route_policy,
+        expected_policy_sha256=args.route_policy_sha256,
     )
     print(json.dumps(report["checks"], sort_keys=True))
     return 0

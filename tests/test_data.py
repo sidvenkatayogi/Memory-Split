@@ -74,6 +74,37 @@ def test_weighted_batch_aligns_weights_to_next_token(tmp_path):
     assert torch.equal(weights, expected)
 
 
+def test_nonzero_cursor_sidecar_alignment_uses_the_same_token_window(tmp_path):
+    bp, mp = make_shards(tmp_path)
+    wp, raw_weights = make_weights(tmp_path)
+    start_cursor = 37
+    ds = PackedShards(
+        bp,
+        mp,
+        ctx=4,
+        batch_size=2,
+        device="cpu",
+        start_cursor=start_cursor,
+        weights_path=wp,
+    )
+
+    x, _, weights = ds.next_weighted_batch()
+
+    token_window = np.memmap(bp, dtype=np.uint16, mode="r")[
+        start_cursor : start_cursor + 10
+    ].reshape(2, 5)
+    expected_x = torch.from_numpy(
+        np.asarray(token_window[:, :-1], dtype=np.int64).copy()
+    )
+    expected_weights = torch.from_numpy(
+        raw_weights[start_cursor : start_cursor + 10]
+        .reshape(2, 5)[:, 1:]
+        .astype(np.float32)
+    )
+    assert torch.equal(x, expected_x)
+    assert torch.equal(weights, expected_weights)
+
+
 def test_weighted_batch_without_sidecar_returns_ones(tmp_path):
     bp, mp = make_shards(tmp_path)
     ds = PackedShards(bp, mp, ctx=16, batch_size=2, device="cpu")

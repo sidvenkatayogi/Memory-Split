@@ -307,7 +307,11 @@ def _write_summary(result: dict, path: Path) -> None:
         "",
         f"- Verdict: **{result['verdict']}**",
         f"- Runs: {result['run_count']}",
-        f"- Pooled seed sigma: {result['pooled_seed_sigma']:.6f}",
+        (
+            "- Pooled 160M within-load seed sigma "
+            "(used for the 360M margin): "
+            f"{result['pooled_seed_sigma']:.6f}"
+        ),
         (
             "- Two-load difference-in-differences: "
             f"{interaction['mean']:+.6f} "

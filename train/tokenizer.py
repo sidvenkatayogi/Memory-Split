@@ -11,15 +11,40 @@ exactly onto token boundaries (no BPE merges across a mask edge).
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
-# Pin the BPE file cache inside the repo (committed) so training jobs and
-# sandboxed processes never need network for tokenizer setup.
-_CACHE_DIR = Path(__file__).resolve().parent.parent / ".tiktoken_cache"
-if "TIKTOKEN_CACHE_DIR" not in os.environ:
-    _CACHE_DIR.mkdir(exist_ok=True)
-    os.environ["TIKTOKEN_CACHE_DIR"] = str(_CACHE_DIR)
+# Pin and authenticate the committed GPT-2 assets before tiktoken can attempt
+# any cache fill. Bundles preserve these paths and hash them in manifest.json.
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "vendor" / "tiktoken"
+_CACHE_ASSET_SHA256 = {
+    "6c7ea1a7e38e3a7f062df639a5b80947f075ffe6": (
+        "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+    ),
+    "6d1cbeee0f20b3d9449abfede4726ed8212e3aee": (
+        "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+    ),
+}
+
+
+def _verify_tiktoken_assets() -> None:
+    if not _CACHE_DIR.is_dir() or _CACHE_DIR.is_symlink():
+        raise RuntimeError(f"vendored tiktoken cache is missing: {_CACHE_DIR}")
+    for name, expected_sha256 in _CACHE_ASSET_SHA256.items():
+        path = _CACHE_DIR / name
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"vendored tiktoken asset is missing: {path}")
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError(f"vendored tiktoken asset hash mismatch: {path}")
+
+
+_verify_tiktoken_assets()
+os.environ["TIKTOKEN_CACHE_DIR"] = str(_CACHE_DIR)
 
 import tiktoken
 

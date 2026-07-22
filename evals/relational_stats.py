@@ -40,7 +40,11 @@ def paired_t_interval(values) -> tuple[float, float, float]:
 
 
 def pooled_seed_sigma(by_load: Mapping) -> float:
-    """Pool within-load seed variance over exactly two loads (four df)."""
+    """Pool within-load seed variance over exactly two loads (four df).
+
+    Protected analysis supplies the two 160M Split-minus-Dense load effects;
+    ``decide_verdict`` uses twice this noise estimate in the 360M margin.
+    """
 
     if not isinstance(by_load, Mapping) or len(by_load) != 2:
         raise ValueError("pooled seed sigma requires exactly two loads")

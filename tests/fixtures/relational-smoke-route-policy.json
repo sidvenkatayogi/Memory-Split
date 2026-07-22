@@ -1,0 +1,12 @@
+{
+  "calibration": {
+    "source": "deterministic local smoke fixture; not a protected-run policy"
+  },
+  "policy": {
+    "hop_cost": 0.25,
+    "read_cost": 0.25,
+    "write_cost": 0.25
+  },
+  "policy_sha256": "bfaa8178633e5ca9078b88ae5d619bfbaeea0d6898e4cf6d068a076c7a9f7649",
+  "schema_version": 1
+}

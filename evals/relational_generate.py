@@ -357,10 +357,6 @@ def _select_cache(cache, indexes: list[int]):
     )
 
 
-def _slice_cache(cache, index: int):
-    return _select_cache(cache, [index])
-
-
 @dataclass
 class _DecodeBatch:
     indexes: list[int]

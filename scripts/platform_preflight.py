@@ -69,7 +69,12 @@ _SOURCE_PREFIXES = (
     "scripts/",
     "tests/",
     "train/",
+    "vendor/",
 )
+_TOKENIZER_ASSETS = {
+    "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
+    "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
+}
 
 
 @dataclass(frozen=True)
@@ -314,6 +319,12 @@ def verify_bundle(
             raise ValueError(f"bundle byte count mismatch: {relative}")
         if item["sha256"] != _sha256_bytes(data):
             raise ValueError(f"bundle member hash mismatch: {relative}")
+    missing_tokenizer_assets = sorted(_TOKENIZER_ASSETS - set(indexed))
+    if missing_tokenizer_assets:
+        raise ValueError(
+            "bundle is missing offline tokenizer assets: "
+            f"{missing_tokenizer_assets}"
+        )
 
     fixture = json.loads(files["fixtures/relational-smoke.json"])
     if fixture != _SMOKE_FIXTURE:
@@ -384,6 +395,7 @@ def verify_bundle(
         "policy_sha256": policy_sha256,
         "smoke_report": smoke_report,
         "member_count": len(indexed),
+        "tokenizer_assets": len(_TOKENIZER_ASSETS),
     }
 
 
@@ -606,6 +618,7 @@ def _farm_gpu_detail(probe) -> dict:
 
 def _aws_gpu_detail(probe) -> dict:
     devices = probe.gpu_info()
+    # Frozen p5.48xlarge topology, not a minimum based on the six-job queue.
     if len(devices) != 8:
         raise ValueError("AWS requires exactly eight visible GPUs")
     if any("H100" not in device.name for device in devices):

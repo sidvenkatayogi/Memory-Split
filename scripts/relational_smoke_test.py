@@ -56,6 +56,15 @@ _BED = (
     "The old observatory records each comet crossing the night sky.",
     "Bees communicate the location of food through patterned movements.",
 )
+_ROUTE_POLICY_SHA256 = (
+    "bfaa8178633e5ca9078b88ae5d619bfbaeea0d6898e4cf6d068a076c7a9f7649"
+)
+_ROUTE_POLICY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fixtures"
+    / "relational-smoke-route-policy.json"
+)
 
 
 def _bed_stream():
@@ -201,6 +210,8 @@ def run_smoke(
         tok,
         _bed_stream(),
         corpus,
+        route_policy_path=_ROUTE_POLICY_PATH,
+        expected_policy_sha256=_ROUTE_POLICY_SHA256,
     )
     if not all(build_report["checks"].values()):
         raise AssertionError("smoke corpus failed relational build checks")

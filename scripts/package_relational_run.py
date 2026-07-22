@@ -34,9 +34,14 @@ _SOURCE_PREFIXES = (
     "tests/",
     "train/",
 )
+_TOKENIZER_ASSETS = {
+    "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
+    "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
+}
 _TASK5_SOURCE = {
     "scripts/package_relational_run.py",
     "scripts/relational_smoke_test.py",
+    "tests/fixtures/relational-smoke-route-policy.json",
     "tests/test_relational_bundle.py",
     "tests/test_relational_smoke.py",
 }
@@ -246,11 +251,17 @@ def production_inputs(input_root: Path | str = ".") -> dict:
 def _tracked_source_paths(source_root: Path) -> list[str]:
     tracked = {
         line
-        for line in _run_git(source_root, "ls-files", "*.py", "requirements.txt")
+        for line in _run_git(
+            source_root,
+            "ls-files",
+            "*.py",
+            "requirements.txt",
+            "vendor/tiktoken/*",
+        )
         .splitlines()
         if line
     }
-    required_task_source = _TASK5_SOURCE | _TASK6_SOURCE
+    required_task_source = _TASK5_SOURCE | _TASK6_SOURCE | _TOKENIZER_ASSETS
     selected = {
         path
         for path in tracked | required_task_source
@@ -259,6 +270,11 @@ def _tracked_source_paths(source_root: Path) -> list[str]:
         or path.endswith(".py")
         and path.startswith(_SOURCE_PREFIXES)
     }
+    untracked_assets = sorted(_TOKENIZER_ASSETS - tracked)
+    if untracked_assets:
+        raise ValueError(
+            f"tokenizer assets must be tracked: {untracked_assets}"
+        )
     missing = [
         path
         for path in sorted(selected)

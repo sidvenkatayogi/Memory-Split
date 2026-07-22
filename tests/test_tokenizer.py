@@ -1,5 +1,74 @@
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 from corpusgen.records import lookup_segments, plain
 from train.tokenizer import get_tok
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+VENDORED_TIKTOKEN_ASSETS = {
+    "6c7ea1a7e38e3a7f062df639a5b80947f075ffe6": (
+        "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+    ),
+    "6d1cbeee0f20b3d9449abfede4726ed8212e3aee": (
+        "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+    ),
+}
+
+
+def test_gpt2_tiktoken_assets_are_vendored_with_frozen_hashes():
+    root = REPO_ROOT / "vendor" / "tiktoken"
+    assert {
+        path.name for path in root.iterdir() if path.is_file()
+    } == set(VENDORED_TIKTOKEN_ASSETS)
+    for name, expected in VENDORED_TIKTOKEN_ASSETS.items():
+        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == expected
+
+
+def test_tokenizer_import_and_encode_work_with_network_blocked():
+    script = r"""
+import os
+from pathlib import Path
+import socket
+
+def blocked(*args, **kwargs):
+    raise AssertionError("network access attempted")
+
+class OfflineSocket(socket.socket):
+    def connect(self, *args, **kwargs):
+        blocked(*args, **kwargs)
+    def connect_ex(self, *args, **kwargs):
+        blocked(*args, **kwargs)
+
+socket.socket = OfflineSocket
+socket.create_connection = blocked
+
+from train.tokenizer import get_tok
+
+tok = get_tok()
+text = "offline tokenizer <|graph_start|>"
+ids = tok.encode(text)
+assert tok.decode(ids) == text
+cache = Path(os.environ["TIKTOKEN_CACHE_DIR"]).resolve()
+assert cache == (Path.cwd() / "vendor" / "tiktoken").resolve()
+print("offline-tokenizer-ok")
+"""
+    env = dict(os.environ)
+    env.pop("TIKTOKEN_CACHE_DIR", None)
+    env.pop("DATA_GYM_CACHE_DIR", None)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "offline-tokenizer-ok"
 
 
 def test_special_tokens_atomic():

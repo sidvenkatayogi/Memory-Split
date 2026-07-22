@@ -20,6 +20,7 @@ corpusgen/    seeded generators: biographies (the dose), iGSM-lite math,
 organizer/    exact-match (entity, relation) -> value store + query grammar
 train/        tokenizer (GPT-2 BPE + 4 special tokens), GPT model,
               memmap+mask dataloader, AdamW trainer with checkpoint/resume
+vendor/       tracked GPT-2 tiktoken cache assets for offline execution
 evals/        generative scorers with lookup interception, recall probes,
               bits-in-weights accounting, natural benchmarks, paired stats,
               dose-response figure
@@ -38,6 +39,9 @@ export PYTHONPATH=.
 .venv/bin/python -m pytest tests -q          # offline unit tests
 .venv/bin/python scripts/smoke_test.py       # end-to-end toy pilot (CPU/MPS)
 ```
+
+Tokenizer initialization verifies and reads the tracked files in
+`vendor/tiktoken/`; it does not populate a cache from the network.
 
 The smoke test builds a toy corpus (500 entities), trains dense and split
 toy models for a few hundred steps, and asserts the mechanism: split-arm
