@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import shutil
 import sys
 import tarfile
@@ -16,6 +17,7 @@ import yaml
 from scripts.make_relational_manifest import (
     ROUTE_POLICY_SHA256,
     make_jobs,
+    resolve_job,
     write_manifests,
 )
 from scripts.package_relational_run import package_run
@@ -196,6 +198,7 @@ def _gate_mode_summary(memory: str, score: float) -> dict:
 def _write_gate_runs(
     root: Path,
     *,
+    data_root: Path,
     jobs: list[dict] | None = None,
     score: float = 0.80,
 ) -> None:
@@ -203,15 +206,28 @@ def _write_gate_runs(
         run = root / job["out_rel"]
         run.mkdir(parents=True, exist_ok=True)
         (run / "config.yaml").write_text(
-            yaml.safe_dump(job, sort_keys=False)
+            yaml.safe_dump(
+                resolve_job(
+                    job,
+                    data_root=data_root,
+                    out_root=root,
+                ),
+                sort_keys=False,
+            )
         )
         evals = run / "evals"
         evals.mkdir()
+        memory_on = _gate_mode_summary("on", score)
+        mode_dir = evals / "memory_on"
+        mode_dir.mkdir()
+        (mode_dir / "summary.json").write_text(
+            json.dumps(memory_on, indent=2, sort_keys=True) + "\n"
+        )
         summary = {
             "condition": job["condition"],
             "modes": {
                 "off": _gate_mode_summary("off", score),
-                "on": _gate_mode_summary("on", score),
+                "on": memory_on,
             },
             "guardrails": {},
         }
@@ -221,7 +237,17 @@ def _write_gate_runs(
 
 
 def _gate_summary_path(root: Path, job: dict) -> Path:
-    return root / job["out_rel"] / "evals" / "relational_summary.json"
+    return (
+        root
+        / job["out_rel"]
+        / "evals"
+        / "memory_on"
+        / "summary.json"
+    )
+
+
+def _gate_config_path(root: Path, job: dict) -> Path:
+    return root / job["out_rel"] / "config.yaml"
 
 
 def _write_aws_runs(root: Path, *, throughput: float = 61_000.0) -> None:
@@ -436,7 +462,7 @@ def test_farmshare_preflight_accepts_injected_l40s_fixture(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root)
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
 
     report = module.run_preflight(
         "farmshare",
@@ -462,7 +488,7 @@ def test_farmshare_preflight_requires_gate_and_160m_corpora(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root, ("29m", "160m"))
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
 
     report = module.run_preflight(
         "farmshare",
@@ -483,7 +509,11 @@ def test_farmshare_preflight_fails_closed_on_missing_gate_summary(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root, ("29m", "160m"))
-    _write_gate_runs(out_root, jobs=[make_jobs("29m")[0]])
+    _write_gate_runs(
+        out_root,
+        data_root=data_root,
+        jobs=[make_jobs("29m")[0]],
+    )
 
     report = module.run_preflight(
         "farmshare",
@@ -511,14 +541,14 @@ def test_farmshare_preflight_requires_each_gate_stratum_above_threshold(
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root, ("29m", "160m"))
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     dense = make_jobs("29m")[0]
     path = _gate_summary_path(out_root, dense)
     summary = json.loads(path.read_text())
-    summary["modes"]["on"]["tasks"][task][
+    summary["tasks"][task][
         "counterfactual_pair_accuracy"
     ] = 0.75
-    summary["modes"]["on"]["primary_composite"] = (0.75 + 0.80 + 0.80) / 3
+    summary["primary_composite"] = (0.75 + 0.80 + 0.80) / 3
     path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
     report = module.run_preflight(
@@ -542,7 +572,7 @@ def test_farmshare_preflight_rejects_duplicate_gate_run_summary(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root, ("29m", "160m"))
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     duplicate = out_root / "duplicate-gate-run"
     shutil.copytree(out_root / "toy_dense_gate_s0", duplicate)
 
@@ -568,11 +598,11 @@ def test_farmshare_preflight_rejects_mismatched_gate_summary(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root, ("29m", "160m"))
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     split = make_jobs("29m")[1]
     path = _gate_summary_path(out_root, split)
     summary = json.loads(path.read_text())
-    summary["condition"] = "dense"
+    summary["memory"] = "off"
     path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
     report = module.run_preflight(
@@ -585,7 +615,153 @@ def test_farmshare_preflight_rejects_mismatched_gate_summary(tmp_path):
 
     assert report["ok"] is False
     assert report["checks"]["learnability"]["passed"] is False
-    assert "condition" in report["checks"]["learnability"]["detail"]
+    assert "memory-on summary" in report["checks"]["learnability"]["detail"]
+
+
+def test_farmshare_preflight_rejects_gate_max_steps_override(tmp_path):
+    module = _preflight_module()
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "out"
+    data_root.mkdir()
+    out_root.mkdir()
+    _stage_corpora(data_root, ("29m", "160m"))
+    _write_gate_runs(out_root, data_root=data_root)
+    dense = make_jobs("29m")[0]
+    path = _gate_config_path(out_root, dense)
+    config = yaml.safe_load(path.read_text())
+    config["max_steps"] = 1
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    report = module.run_preflight(
+        "farmshare",
+        bundle=_make_bundle(tmp_path),
+        probe=_farm_probe(module),
+        data_root=data_root,
+        out_root=out_root,
+    )
+
+    assert report["ok"] is False
+    assert report["checks"]["learnability"]["passed"] is False
+    assert "runtime config" in report["checks"]["learnability"]["detail"]
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("train_bin", "split.weights.bin"),
+        ("train_weights", "random.weights.bin"),
+    ],
+)
+def test_farmshare_preflight_rejects_gate_training_path_override(
+    tmp_path,
+    field,
+    replacement,
+):
+    module = _preflight_module()
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "out"
+    data_root.mkdir()
+    out_root.mkdir()
+    _stage_corpora(data_root, ("29m", "160m"))
+    _write_gate_runs(out_root, data_root=data_root)
+    dense = make_jobs("29m")[0]
+    path = _gate_config_path(out_root, dense)
+    config = yaml.safe_load(path.read_text())
+    config[field] = str(data_root / dense["data_rel"] / replacement)
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    report = module.run_preflight(
+        "farmshare",
+        bundle=_make_bundle(tmp_path),
+        probe=_farm_probe(module),
+        data_root=data_root,
+        out_root=out_root,
+    )
+
+    assert report["ok"] is False
+    assert report["checks"]["learnability"]["passed"] is False
+    assert field in report["checks"]["learnability"]["detail"]
+
+
+def test_farmshare_preflight_rejects_extra_gate_runtime_key(tmp_path):
+    module = _preflight_module()
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "out"
+    data_root.mkdir()
+    out_root.mkdir()
+    _stage_corpora(data_root, ("29m", "160m"))
+    _write_gate_runs(out_root, data_root=data_root)
+    dense = make_jobs("29m")[0]
+    path = _gate_config_path(out_root, dense)
+    config = yaml.safe_load(path.read_text())
+    config["unexpected"] = "bypass"
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+    report = module.run_preflight(
+        "farmshare",
+        bundle=_make_bundle(tmp_path),
+        probe=_farm_probe(module),
+        data_root=data_root,
+        out_root=out_root,
+    )
+
+    assert report["ok"] is False
+    assert report["checks"]["learnability"]["passed"] is False
+    assert "unexpected" in report["checks"]["learnability"]["detail"]
+
+
+def test_farmshare_preflight_rejects_symlinked_gate_evals_directory(tmp_path):
+    module = _preflight_module()
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "out"
+    data_root.mkdir()
+    out_root.mkdir()
+    _stage_corpora(data_root, ("29m", "160m"))
+    _write_gate_runs(out_root, data_root=data_root)
+    dense = make_jobs("29m")[0]
+    evals = out_root / dense["out_rel"] / "evals"
+    moved = tmp_path / "moved-evals"
+    evals.rename(moved)
+    evals.symlink_to(moved, target_is_directory=True)
+
+    report = module.run_preflight(
+        "farmshare",
+        bundle=_make_bundle(tmp_path),
+        probe=_farm_probe(module),
+        data_root=data_root,
+        out_root=out_root,
+    )
+
+    assert report["ok"] is False
+    assert report["checks"]["learnability"]["passed"] is False
+    assert "symlink" in report["checks"]["learnability"]["detail"]
+
+
+def test_farmshare_preflight_rejects_hardlinked_gate_summaries(tmp_path):
+    module = _preflight_module()
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "out"
+    data_root.mkdir()
+    out_root.mkdir()
+    _stage_corpora(data_root, ("29m", "160m"))
+    _write_gate_runs(out_root, data_root=data_root)
+    dense, split = make_jobs("29m")
+    dense_summary = _gate_summary_path(out_root, dense)
+    split_summary = _gate_summary_path(out_root, split)
+    split_summary.unlink()
+    os.link(dense_summary, split_summary)
+
+    report = module.run_preflight(
+        "farmshare",
+        bundle=_make_bundle(tmp_path),
+        probe=_farm_probe(module),
+        data_root=data_root,
+        out_root=out_root,
+    )
+
+    assert report["ok"] is False
+    assert report["checks"]["learnability"]["passed"] is False
+    assert "distinct" in report["checks"]["learnability"]["detail"]
 
 
 def test_farmshare_preflight_fails_closed_on_slurm(tmp_path):
@@ -595,7 +771,7 @@ def test_farmshare_preflight_fails_closed_on_slurm(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root)
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     probe = _farm_probe(
         module,
         commands=frozenset({"nvidia-smi", "sbatch", "scontrol"}),
@@ -620,7 +796,7 @@ def test_farmshare_preflight_fails_closed_on_space_gpu_and_resume(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root)
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     probe = _farm_probe(
         module,
         gpus=(
@@ -662,7 +838,7 @@ def test_farmshare_preflight_fails_closed_on_corpus_hashes(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root)
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     first = make_jobs("160m")[0]
     (data_root / first["data_rel"] / "train.bin").write_bytes(b"tampered")
 
@@ -685,7 +861,7 @@ def test_farmshare_preflight_fails_closed_on_route_guardrails(tmp_path):
     data_root.mkdir()
     out_root.mkdir()
     _stage_corpora(data_root, ("29m", "160m"))
-    _write_gate_runs(out_root)
+    _write_gate_runs(out_root, data_root=data_root)
     first = make_jobs("160m")[0]
     corpus = data_root / first["data_rel"]
     audit_path = corpus / "eval" / "route-audit.json"

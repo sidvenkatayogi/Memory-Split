@@ -10,6 +10,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -26,6 +27,7 @@ if __package__ in (None, ""):
 from scripts.make_relational_manifest import (  # noqa: E402
     ROUTE_POLICY_SHA256,
     make_jobs,
+    resolve_job,
 )
 from scripts.relational_smoke_test import (  # noqa: E402
     SMOKE_FIXTURE,
@@ -678,26 +680,70 @@ def _read_unique_json_object(path: Path) -> dict:
     return value
 
 
+def _existing_root(value: Path | str | None, *, label: str) -> Path:
+    if value is None:
+        raise ValueError(f"{label} is required")
+    path = Path(value)
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError(f"{label} must be an existing absolute directory")
+    return path.resolve(strict=True)
+
+
+def _safe_path_identity(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+    kind: str,
+) -> tuple[Path, tuple[int, int]]:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{label} escapes its declared root") from error
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} contains a symlink: {current}")
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (FileNotFoundError, ValueError) as error:
+        raise ValueError(f"{label} is missing or escapes its declared root") from error
+    info = resolved.stat()
+    valid_kind = (
+        stat.S_ISDIR(info.st_mode)
+        if kind == "directory"
+        else stat.S_ISREG(info.st_mode)
+    )
+    if not valid_kind:
+        raise ValueError(f"{label} must be a {kind}")
+    return resolved, (info.st_dev, info.st_ino)
+
+
+def _exact_runtime_config(job: dict, config: dict, expected: dict) -> None:
+    expected_keys = set(expected)
+    actual_keys = set(config)
+    if actual_keys != expected_keys:
+        missing = sorted(str(key) for key in expected_keys - actual_keys)
+        unexpected = sorted(str(key) for key in actual_keys - expected_keys)
+        raise ValueError(
+            f"{job['run_id']}: runtime config keys mismatch; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    mismatched = [
+        key
+        for key, value in expected.items()
+        if type(config[key]) is not type(value) or config[key] != value
+    ]
+    if mismatched:
+        raise ValueError(
+            f"{job['run_id']}: runtime config values mismatch: "
+            f"{sorted(mismatched)}"
+        )
+
+
 def _learnability_scores(summary: dict, job: dict) -> dict[str, float]:
-    if set(summary) != {"condition", "modes", "guardrails"}:
-        raise ValueError(
-            f"{job['run_id']}: relational summary schema is mismatched"
-        )
-    if summary["condition"] != job["condition"]:
-        raise ValueError(
-            f"{job['run_id']}: summary condition does not match its run"
-        )
-    modes = summary["modes"]
-    if not isinstance(modes, Mapping) or set(modes) != {"off", "on"}:
-        raise ValueError(
-            f"{job['run_id']}: summary requires memory off and on modes"
-        )
-    if (
-        not isinstance(modes["off"], Mapping)
-        or modes["off"].get("memory") != "off"
-    ):
-        raise ValueError(f"{job['run_id']}: memory-off summary is mismatched")
-    memory_on = modes["on"]
     expected_mode_fields = {
         "memory",
         "tasks",
@@ -706,17 +752,17 @@ def _learnability_scores(summary: dict, job: dict) -> dict[str, float]:
         "n_pairs_per_task",
     }
     if (
-        not isinstance(memory_on, Mapping)
-        or set(memory_on) != expected_mode_fields
-        or memory_on["memory"] != "on"
-        or memory_on["n_pairs_per_task"] != LEARNABILITY_PAIRS_PER_TASK
-        or memory_on["n_rows"]
+        not isinstance(summary, Mapping)
+        or set(summary) != expected_mode_fields
+        or summary["memory"] != "on"
+        or summary["n_pairs_per_task"] != LEARNABILITY_PAIRS_PER_TASK
+        or summary["n_rows"]
         != 2 * LEARNABILITY_PAIRS_PER_TASK * len(LEARNABILITY_TASKS)
     ):
         raise ValueError(
             f"{job['run_id']}: memory-on summary is incomplete or mismatched"
         )
-    tasks = memory_on["tasks"]
+    tasks = summary["tasks"]
     if not isinstance(tasks, Mapping) or set(tasks) != set(LEARNABILITY_TASKS):
         raise ValueError(
             f"{job['run_id']}: summary task set is incomplete or mismatched"
@@ -753,7 +799,7 @@ def _learnability_scores(summary: dict, job: dict) -> dict[str, float]:
             )
         scores[task] = score
 
-    composite = memory_on["primary_composite"]
+    composite = summary["primary_composite"]
     expected_composite = sum(scores.values()) / len(scores)
     if (
         isinstance(composite, bool)
@@ -772,23 +818,20 @@ def _learnability_scores(summary: dict, job: dict) -> dict[str, float]:
     return scores
 
 
-def _farmshare_learnability_detail(runs_root: Path | str | None) -> dict:
-    if runs_root is None:
-        raise ValueError("FarmShare output root is required for learnability")
-    root = Path(runs_root)
-    if not root.is_absolute() or not root.is_dir():
-        raise ValueError(
-            "FarmShare output root must be an existing absolute directory"
-        )
-    root = root.resolve()
+def _farmshare_learnability_detail(
+    data_root: Path | str | None,
+    out_root: Path | str | None,
+) -> dict:
+    data_base = _existing_root(data_root, label="FarmShare data root")
+    out_base = _existing_root(out_root, label="FarmShare output root")
     expected_jobs = make_jobs("29m")
     expected_by_id = {job["run_id"]: job for job in expected_jobs}
     candidates = {run_id: [] for run_id in expected_by_id}
     canonical = {
-        job["run_id"]: root / job["out_rel"] for job in expected_jobs
+        job["run_id"]: out_base / job["out_rel"] for job in expected_jobs
     }
 
-    for directory in root.iterdir():
+    for directory in out_base.iterdir():
         if not directory.is_dir() or directory.is_symlink():
             continue
         config_path = directory / "config.yaml"
@@ -814,7 +857,8 @@ def _farmshare_learnability_detail(runs_root: Path | str | None) -> dict:
                 raise ValueError(f"{run_id}: gate run config is unsafe")
             candidates[run_id].append((directory, config))
 
-    summaries = []
+    runs = []
+    config_files = set()
     summary_files = set()
     for job in expected_jobs:
         run_id = job["run_id"]
@@ -827,30 +871,115 @@ def _farmshare_learnability_detail(runs_root: Path | str | None) -> dict:
         run_dir, config = matches[0]
         if run_dir != canonical[run_id]:
             raise ValueError(f"{run_id}: run directory is mismatched")
-        mismatched = [
-            key for key, expected in job.items() if config.get(key) != expected
-        ]
-        if mismatched:
-            raise ValueError(
-                f"{run_id}: run config is mismatched: {sorted(mismatched)}"
-            )
-        summary_path = run_dir / "evals" / "relational_summary.json"
+        run_dir, run_identity = _safe_path_identity(
+            out_base,
+            run_dir,
+            label=f"{run_id} run directory",
+            kind="directory",
+        )
+        config_path = run_dir / "config.yaml"
+        _, config_identity = _safe_path_identity(
+            out_base,
+            config_path,
+            label=f"{run_id} runtime config",
+            kind="regular file",
+        )
+        if config_identity in config_files:
+            raise ValueError("29M gate runtime configs must be distinct files")
+        config_files.add(config_identity)
+
+        data_dir, data_identity = _safe_path_identity(
+            data_base,
+            data_base / job["data_rel"],
+            label=f"{run_id} data directory",
+            kind="directory",
+        )
+        train_bin, train_identity = _safe_path_identity(
+            data_base,
+            data_dir / "train.bin",
+            label=f"{run_id} train_bin",
+            kind="regular file",
+        )
+        train_weights, weights_identity = _safe_path_identity(
+            data_base,
+            data_dir / f"{job['condition']}.weights.bin",
+            label=f"{run_id} train_weights",
+            kind="regular file",
+        )
+        expected = resolve_job(
+            job,
+            data_root=data_base,
+            out_root=out_base,
+        )
+        _exact_runtime_config(job, config, expected)
+        if (
+            config["data_dir"] != str(data_dir)
+            or config["train_bin"] != str(train_bin)
+            or config["train_weights"] != str(train_weights)
+            or config["out_dir"] != str(run_dir)
+        ):
+            raise ValueError(f"{run_id}: resolved runtime paths are mismatched")
+
+        summary_path = run_dir / "evals" / "memory_on" / "summary.json"
+        summary_path, summary_identity = _safe_path_identity(
+            out_base,
+            summary_path,
+            label=f"{run_id} memory-on summary",
+            kind="regular file",
+        )
         summary = _read_unique_json_object(summary_path)
-        identity = (summary_path.stat().st_dev, summary_path.stat().st_ino)
-        if identity in summary_files:
-            raise ValueError("29M gate contains duplicate summary files")
-        summary_files.add(identity)
-        summaries.append(
+        if summary_identity in summary_files:
+            raise ValueError("29M gate summaries must be distinct files")
+        summary_files.add(summary_identity)
+        runs.append(
             {
                 "run_id": run_id,
                 "condition": job["condition"],
                 "scores": _learnability_scores(summary, job),
+                "runtime_config": str(config_path),
+                "summary": str(summary_path),
+                "run_identity": run_identity,
+                "data_identity": data_identity,
+                "train_identity": train_identity,
+                "weights_identity": weights_identity,
+                "runtime": config,
             }
         )
+
+    if len({run["run_identity"] for run in runs}) != len(expected_jobs):
+        raise ValueError("29M gate run directories must be distinct")
+    if len({run["data_identity"] for run in runs}) != 1:
+        raise ValueError("29M Dense/Split must share one gate corpus")
+    if len({run["train_identity"] for run in runs}) != 1:
+        raise ValueError("29M Dense/Split must share one train_bin")
+    if len({run["weights_identity"] for run in runs}) != len(expected_jobs):
+        raise ValueError("29M Dense/Split require distinct condition sidecars")
+    runtime_by_condition = {run["condition"]: run["runtime"] for run in runs}
+    if (
+        runtime_by_condition["dense"]["train_bin"]
+        != runtime_by_condition["split"]["train_bin"]
+        or not runtime_by_condition["dense"]["train_weights"].endswith(
+            "/dense.weights.bin"
+        )
+        or not runtime_by_condition["split"]["train_weights"].endswith(
+            "/split.weights.bin"
+        )
+    ):
+        raise ValueError("29M Dense/Split runtime pairing is mismatched")
+
     return {
         "threshold": LEARNABILITY_THRESHOLD,
         "comparison": "strictly_greater",
-        "runs": summaries,
+        "runs": [
+            {
+                "run_id": run["run_id"],
+                "condition": run["condition"],
+                "scores": run["scores"],
+                "runtime_config": run["runtime_config"],
+                "summary": run["summary"],
+            }
+            for run in runs
+        ],
     }
 
 
@@ -1024,7 +1153,7 @@ def run_preflight(
     if platform == "farmshare":
         record(
             "learnability",
-            lambda: _farmshare_learnability_detail(out_root),
+            lambda: _farmshare_learnability_detail(data_root, out_root),
         )
         required_slurm = ("sbatch", "scontrol", "sinfo")
         record(
