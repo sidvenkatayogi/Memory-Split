@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
@@ -45,6 +46,13 @@ AWS_THROUGHPUT_MIN = 60_000.0
 AWS_WARMUP_STEPS = 50
 AWS_PROBE_STEPS = 200
 RESUME_TOLERANCE = 1e-5
+LEARNABILITY_THRESHOLD = 0.75
+LEARNABILITY_PAIRS_PER_TASK = 10_000
+LEARNABILITY_TASKS = (
+    "path_composition",
+    "date_ordering",
+    "balanced_equality",
+)
 _SMOKE_FIXTURE = {
     "data_seed": SMOKE_FIXTURE["data_seed"],
     "eval_pairs_per_task": SMOKE_FIXTURE["eval_pairs_per_task"],
@@ -646,6 +654,206 @@ def _disk_detail(probe, root: Path | str | None, minimum: int) -> dict:
     return asdict(disk)
 
 
+def _read_unique_json_object(path: Path) -> dict:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"summary is missing or unsafe: {path}")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"JSON object contains duplicate key: {key}")
+            value[key] = item
+        return value
+
+    value = json.loads(
+        path.read_text(),
+        object_pairs_hook=unique_object,
+        parse_constant=lambda constant: (_ for _ in ()).throw(
+            ValueError(f"JSON contains non-finite value: {constant}")
+        ),
+    )
+    if not isinstance(value, dict):
+        raise ValueError(f"summary must contain a JSON object: {path}")
+    return value
+
+
+def _learnability_scores(summary: dict, job: dict) -> dict[str, float]:
+    if set(summary) != {"condition", "modes", "guardrails"}:
+        raise ValueError(
+            f"{job['run_id']}: relational summary schema is mismatched"
+        )
+    if summary["condition"] != job["condition"]:
+        raise ValueError(
+            f"{job['run_id']}: summary condition does not match its run"
+        )
+    modes = summary["modes"]
+    if not isinstance(modes, Mapping) or set(modes) != {"off", "on"}:
+        raise ValueError(
+            f"{job['run_id']}: summary requires memory off and on modes"
+        )
+    if (
+        not isinstance(modes["off"], Mapping)
+        or modes["off"].get("memory") != "off"
+    ):
+        raise ValueError(f"{job['run_id']}: memory-off summary is mismatched")
+    memory_on = modes["on"]
+    expected_mode_fields = {
+        "memory",
+        "tasks",
+        "primary_composite",
+        "n_rows",
+        "n_pairs_per_task",
+    }
+    if (
+        not isinstance(memory_on, Mapping)
+        or set(memory_on) != expected_mode_fields
+        or memory_on["memory"] != "on"
+        or memory_on["n_pairs_per_task"] != LEARNABILITY_PAIRS_PER_TASK
+        or memory_on["n_rows"]
+        != 2 * LEARNABILITY_PAIRS_PER_TASK * len(LEARNABILITY_TASKS)
+    ):
+        raise ValueError(
+            f"{job['run_id']}: memory-on summary is incomplete or mismatched"
+        )
+    tasks = memory_on["tasks"]
+    if not isinstance(tasks, Mapping) or set(tasks) != set(LEARNABILITY_TASKS):
+        raise ValueError(
+            f"{job['run_id']}: summary task set is incomplete or mismatched"
+        )
+
+    scores = {}
+    for task in LEARNABILITY_TASKS:
+        measurement = tasks[task]
+        if (
+            not isinstance(measurement, Mapping)
+            or measurement.get("n_pairs") != LEARNABILITY_PAIRS_PER_TASK
+            or measurement.get("n_rows")
+            != 2 * LEARNABILITY_PAIRS_PER_TASK
+        ):
+            raise ValueError(
+                f"{job['run_id']}:{task}: evaluation is incomplete"
+            )
+        raw_score = measurement.get("counterfactual_pair_accuracy")
+        if isinstance(raw_score, bool) or not isinstance(
+            raw_score, (int, float)
+        ):
+            raise ValueError(
+                f"{job['run_id']}:{task}: pair accuracy is not numeric"
+            )
+        score = float(raw_score)
+        if (
+            not math.isfinite(score)
+            or score <= LEARNABILITY_THRESHOLD
+            or score > 1.0
+        ):
+            raise ValueError(
+                f"{job['run_id']}:{task}: counterfactual pair accuracy "
+                "must be finite, at most 1.0, and greater than 0.75"
+            )
+        scores[task] = score
+
+    composite = memory_on["primary_composite"]
+    expected_composite = sum(scores.values()) / len(scores)
+    if (
+        isinstance(composite, bool)
+        or not isinstance(composite, (int, float))
+        or not math.isfinite(float(composite))
+        or not math.isclose(
+            float(composite),
+            expected_composite,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError(
+            f"{job['run_id']}: primary composite is inconsistent"
+        )
+    return scores
+
+
+def _farmshare_learnability_detail(runs_root: Path | str | None) -> dict:
+    if runs_root is None:
+        raise ValueError("FarmShare output root is required for learnability")
+    root = Path(runs_root)
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError(
+            "FarmShare output root must be an existing absolute directory"
+        )
+    root = root.resolve()
+    expected_jobs = make_jobs("29m")
+    expected_by_id = {job["run_id"]: job for job in expected_jobs}
+    candidates = {run_id: [] for run_id in expected_by_id}
+    canonical = {
+        job["run_id"]: root / job["out_rel"] for job in expected_jobs
+    }
+
+    for directory in root.iterdir():
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        config_path = directory / "config.yaml"
+        if not config_path.exists():
+            continue
+        try:
+            config = yaml.safe_load(config_path.read_text())
+        except Exception:
+            if directory in canonical.values():
+                raise ValueError(
+                    f"{directory.name}: gate run config cannot be read"
+                )
+            continue
+        if not isinstance(config, dict):
+            if directory in canonical.values():
+                raise ValueError(
+                    f"{directory.name}: gate run config is not a mapping"
+                )
+            continue
+        run_id = config.get("run_id")
+        if run_id in candidates:
+            if config_path.is_symlink():
+                raise ValueError(f"{run_id}: gate run config is unsafe")
+            candidates[run_id].append((directory, config))
+
+    summaries = []
+    summary_files = set()
+    for job in expected_jobs:
+        run_id = job["run_id"]
+        matches = candidates[run_id]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{run_id}: requires exactly one completed run, "
+                f"found {len(matches)}"
+            )
+        run_dir, config = matches[0]
+        if run_dir != canonical[run_id]:
+            raise ValueError(f"{run_id}: run directory is mismatched")
+        mismatched = [
+            key for key, expected in job.items() if config.get(key) != expected
+        ]
+        if mismatched:
+            raise ValueError(
+                f"{run_id}: run config is mismatched: {sorted(mismatched)}"
+            )
+        summary_path = run_dir / "evals" / "relational_summary.json"
+        summary = _read_unique_json_object(summary_path)
+        identity = (summary_path.stat().st_dev, summary_path.stat().st_ino)
+        if identity in summary_files:
+            raise ValueError("29M gate contains duplicate summary files")
+        summary_files.add(identity)
+        summaries.append(
+            {
+                "run_id": run_id,
+                "condition": job["condition"],
+                "scores": _learnability_scores(summary, job),
+            }
+        )
+    return {
+        "threshold": LEARNABILITY_THRESHOLD,
+        "comparison": "strictly_greater",
+        "runs": summaries,
+    }
+
+
 def _aws_run_evidence(runs_root: Path | str | None) -> dict:
     if runs_root is None:
         raise ValueError("AWS runs root is required")
@@ -793,7 +1001,7 @@ def run_preflight(
                     data_root,
                     bundle_evidence["policy"],
                     scales=(
-                        ("160m",)
+                        ("29m", "160m")
                         if platform == "farmshare"
                         else ("360m",)
                     ),
@@ -814,6 +1022,10 @@ def run_preflight(
         )
 
     if platform == "farmshare":
+        record(
+            "learnability",
+            lambda: _farmshare_learnability_detail(out_root),
+        )
         required_slurm = ("sbatch", "scontrol", "sinfo")
         record(
             "slurm",

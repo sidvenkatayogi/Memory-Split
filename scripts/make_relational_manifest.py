@@ -22,6 +22,12 @@ ROUTE_POLICY_SHA256 = (
     "0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058"
 )
 SCALE_SETTINGS = {
+    "29m": {
+        "model": "toy",
+        "total_tokens": 299_892_736,
+        "micro_batch_size": 16,
+        "lr": 1.5e-3,
+    },
     "160m": {
         "model": "d160m",
         "total_tokens": 1_599_602_688,
@@ -36,10 +42,12 @@ SCALE_SETTINGS = {
     },
 }
 LOAD_ENTITIES = {
+    "n_gate": 50_000,
     "n50k": 50_000,
     "n800k": 800_000,
     "n1p8m": 1_800_000,
 }
+PROTECTED_SCALES = ("160m", "360m")
 _RUNTIME_PATH_KEYS = {
     "data_dir",
     "train_bin",
@@ -83,7 +91,9 @@ def _portable_relative(value: str | os.PathLike[str], *, label: str) -> str:
 def _job(scale: str, condition: str, load: str, seed: int) -> dict:
     settings = SCALE_SETTINGS[scale]
     data_seed = DATA_SEED_BASE + seed
-    run_id = f"{settings['model']}_{condition}_{load}_s{seed}"
+    load_label = "gate" if load == "n_gate" else load
+    data_label = "n50k_gate" if load == "n_gate" else load
+    run_id = f"{settings['model']}_{condition}_{load_label}_s{seed}"
     return {
         "schema_version": 1,
         "run_id": run_id,
@@ -93,7 +103,7 @@ def _job(scale: str, condition: str, load: str, seed: int) -> dict:
         "n_entities": LOAD_ENTITIES[load],
         "data_seed": data_seed,
         "seed": seed,
-        "data_rel": f"{load}_ds{data_seed}",
+        "data_rel": f"{data_label}_ds{data_seed}",
         "out_rel": run_id,
         "route_policy_sha256": ROUTE_POLICY_SHA256,
         "total_tokens": settings["total_tokens"],
@@ -113,8 +123,13 @@ def _job(scale: str, condition: str, load: str, seed: int) -> dict:
 
 
 def make_jobs(scale: str) -> list[dict]:
-    """Return the exact frozen jobs for one protected model scale."""
+    """Return the exact frozen jobs for one model scale."""
 
+    if scale == "29m":
+        return [
+            _job(scale, condition, "n_gate", 0)
+            for condition in ("dense", "split")
+        ]
     if scale == "160m":
         jobs = [
             _job(scale, condition, load, seed)
@@ -150,12 +165,21 @@ def _atomic_write(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def write_manifests(root: Path | str = ".") -> dict[str, dict]:
-    """Write deterministic production YAML and relative TSV manifests."""
+def write_manifests(
+    root: Path | str = ".",
+    *,
+    scales: Sequence[str] = PROTECTED_SCALES,
+) -> dict[str, dict]:
+    """Write deterministic YAML and relative TSV manifests."""
 
     root = Path(root)
+    selected = tuple(scales)
+    if len(selected) != len(set(selected)) or any(
+        scale not in SCALE_SETTINGS for scale in selected
+    ):
+        raise ValueError("manifest scales must be unique and known")
     results = {}
-    for scale in SCALE_SETTINGS:
+    for scale in selected:
         config_paths = []
         manifest_rows = []
         for job in make_jobs(scale):
@@ -430,7 +454,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"configs/{scale}.tsv")
             print("dry-run; pass --execute to write manifests", file=sys.stderr)
             return 0
-        results = write_manifests(args.root)
+        results = write_manifests(
+            args.root,
+            scales=tuple(SCALE_SETTINGS),
+        )
         print(
             json.dumps(
                 {

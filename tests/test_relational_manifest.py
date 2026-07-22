@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_MODULE = REPO_ROOT / "scripts" / "make_relational_manifest.py"
 AWS_MODULE = REPO_ROOT / "cluster" / "aws" / "run_relational_manifest.py"
 SEEDS = (0, 1, 2)
+ALL_SCALES = ("29m", "160m", "360m")
 POLICY_SHA256 = (
     "0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058"
 )
@@ -73,8 +74,39 @@ def test_360m_manifest_is_the_exact_frozen_6_run_matrix():
     assert all(job["total_tokens"] == 3_599_761_408 for job in jobs)
 
 
+def test_29m_manifest_is_the_exact_paired_learnability_gate():
+    jobs = _manifest_module().make_jobs("29m")
+
+    assert [job["run_id"] for job in jobs] == [
+        "toy_dense_gate_s0",
+        "toy_split_gate_s0",
+    ]
+    assert [
+        (job["condition"], job["load"], job["seed"]) for job in jobs
+    ] == [
+        ("dense", "n_gate", 0),
+        ("split", "n_gate", 0),
+    ]
+    assert all(job["model"] == "toy" for job in jobs)
+    assert all(job["n_entities"] == 50_000 for job in jobs)
+    assert all(job["data_seed"] == 10_000 for job in jobs)
+    assert all(job["data_rel"] == "n50k_gate_ds10000" for job in jobs)
+    assert all(job["total_tokens"] == 299_892_736 for job in jobs)
+    assert all(job["tokens_per_step"] == 524_288 for job in jobs)
+    assert all(
+        job["total_tokens"] // job["tokens_per_step"] == 572 for job in jobs
+    )
+    assert all(job["ctx"] == 1024 for job in jobs)
+
+    paired_fields = set(jobs[0]) - {"condition", "out_rel", "run_id"}
+    assert {key: jobs[0][key] for key in paired_fields} == {
+        key: jobs[1][key] for key in paired_fields
+    }
+
+
 def test_configs_contain_only_relative_runtime_roots():
-    jobs = _manifest_module().make_jobs("160m")
+    jobs = _manifest_module().make_jobs("29m")
+    jobs += _manifest_module().make_jobs("160m")
     jobs += _manifest_module().make_jobs("360m")
 
     for job in jobs:
@@ -85,9 +117,12 @@ def test_configs_contain_only_relative_runtime_roots():
         }
         assert path_keys == {"data_rel", "out_rel"}
         assert job["data_seed"] == 10_000 + job["seed"]
-        assert job["data_rel"] == (
-            f"{job['load']}_ds{job['data_seed']}"
-        )
+        assert job["data_rel"] == {
+            "n_gate": f"n50k_gate_ds{job['data_seed']}",
+            "n50k": f"n50k_ds{job['data_seed']}",
+            "n800k": f"n800k_ds{job['data_seed']}",
+            "n1p8m": f"n1p8m_ds{job['data_seed']}",
+        }[job["load"]]
         assert job["out_rel"] == job["run_id"]
         assert job["route_policy_sha256"] == POLICY_SHA256
         rendered = yaml.safe_dump(job)
@@ -98,16 +133,48 @@ def test_configs_contain_only_relative_runtime_roots():
         assert not Path(job["out_rel"]).is_absolute()
 
 
+def test_29m_manifest_rendering_uses_exact_relative_config_paths(tmp_path):
+    written = _manifest_module().write_manifests(tmp_path, scales=("29m",))
+    manifest = written["29m"]["manifest"]
+
+    assert manifest.read_text().splitlines() == [
+        "configs/29m/toy_dense_gate_s0.yaml",
+        "configs/29m/toy_split_gate_s0.yaml",
+    ]
+    assert [
+        path.relative_to(tmp_path).as_posix()
+        for path in written["29m"]["configs"]
+    ] == manifest.read_text().splitlines()
+
+
+def test_29m_farmshare_plan_has_two_relative_commands(tmp_path):
+    module = _manifest_module()
+    manifest = module.write_manifests(
+        tmp_path, scales=("29m",)
+    )["29m"]["manifest"]
+
+    plan = module.farmshare_plan(manifest)
+
+    assert plan == [
+        [
+            "sbatch",
+            f"--export=ALL,CONFIG_REL=configs/29m/{run_id}.yaml",
+            "cluster/slurm/relational_train.sbatch",
+        ]
+        for run_id in ("toy_dense_gate_s0", "toy_split_gate_s0")
+    ]
+
+
 def test_manifest_rendering_is_deterministic_and_relative(tmp_path):
     module = _manifest_module()
 
-    first = module.write_manifests(tmp_path)
+    first = module.write_manifests(tmp_path, scales=ALL_SCALES)
     first_bytes = {
         path.relative_to(tmp_path).as_posix(): path.read_bytes()
         for result in first.values()
         for path in (result["manifest"], *result["configs"])
     }
-    second = module.write_manifests(tmp_path)
+    second = module.write_manifests(tmp_path, scales=ALL_SCALES)
     second_bytes = {
         path.relative_to(tmp_path).as_posix(): path.read_bytes()
         for result in second.values()
@@ -115,9 +182,10 @@ def test_manifest_rendering_is_deterministic_and_relative(tmp_path):
     }
 
     assert first_bytes == second_bytes
+    assert len(first["29m"]["configs"]) == 2
     assert len(first["160m"]["configs"]) == 15
     assert len(first["360m"]["configs"]) == 6
-    for scale, count in (("160m", 15), ("360m", 6)):
+    for scale, count in (("29m", 2), ("160m", 15), ("360m", 6)):
         manifest = first[scale]["manifest"]
         rows = manifest.read_text().splitlines()
         assert len(rows) == count
@@ -130,8 +198,16 @@ def test_manifest_rendering_is_deterministic_and_relative(tmp_path):
         )
 
 
+def test_default_manifest_writer_preserves_protected_bundle_scales(tmp_path):
+    written = _manifest_module().write_manifests(tmp_path)
+
+    assert set(written) == {"160m", "360m"}
+
+
 def test_checked_in_manifests_match_generator_byte_for_byte(tmp_path):
-    generated = _manifest_module().write_manifests(tmp_path)
+    generated = _manifest_module().write_manifests(
+        tmp_path, scales=ALL_SCALES
+    )
 
     for result in generated.values():
         for generated_path in (result["manifest"], *result["configs"]):
