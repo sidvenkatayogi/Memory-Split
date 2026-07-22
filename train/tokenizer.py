@@ -1,7 +1,8 @@
-"""GPT-2 BPE tokenizer extended with the four memory-split special tokens.
+"""GPT-2 BPE tokenizer extended with memory-split and graph-control tokens.
 
 Special token ids are frozen (see plan, Global Constraints):
     <|db_start|>=50257  <|db_retrieve|>=50258  <|db_end|>=50259  <|eot|>=50260
+Graph-control token ids occupy the reserved range 50261-50291.
 Vocab is padded to 50304 (multiple of 64) at the model level.
 
 `encode_segments` encodes each segment independently so masked spans map

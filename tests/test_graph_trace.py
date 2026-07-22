@@ -1,3 +1,5 @@
+import pytest
+
 from corpusgen.graph_records import GraphAction, GraphRow
 from corpusgen.graph_trace import serialize_action, serialize_return
 from train.tokenizer import get_tok
@@ -17,11 +19,32 @@ def test_graph_action_is_fixed_width_and_atomic():
     ]
 
 
-def test_halt_action_has_no_read():
+def test_halt_action_is_exact_fixed_width_frame():
     tok = get_tok()
     action = GraphAction(0, "r0", "out", read=False, halt=True)
     ids = serialize_action(action, tok)
-    assert tok.GRAPH_HALT in ids and tok.GRAPH_READ not in ids
+    assert ids == [
+        tok.GRAPH_START,
+        tok.SLOTS[0],
+        tok.RELATIONS["r0"],
+        tok.DIR_OUT,
+        tok.GRAPH_HALT,
+        tok.GRAPH_END,
+    ]
+
+
+def test_noop_action_is_exact_fixed_width_frame():
+    tok = get_tok()
+    action = GraphAction(3, "r15", "in", read=False, halt=False)
+    ids = serialize_action(action, tok)
+    assert ids == [
+        tok.GRAPH_START,
+        tok.SLOTS[3],
+        tok.RELATIONS["r15"],
+        tok.DIR_IN,
+        tok.GRAPH_NOOP,
+        tok.GRAPH_END,
+    ]
 
 
 def test_return_serialization_marks_payload_fact():
@@ -36,6 +59,13 @@ def test_return_serialization_marks_payload_fact():
     assert "fact-1" in fact_ids
 
 
+def test_return_hit_requires_fact_id():
+    row = GraphRow(1, "r2", "out", "entity", "9")
+
+    with pytest.raises(ValueError, match="^hit returns require fact_id$"):
+        serialize_return(row, None)
+
+
 def test_return_miss_has_no_payload():
     tok = get_tok()
     segments = serialize_return(None, None)
@@ -46,7 +76,6 @@ def test_return_miss_has_no_payload():
 
 
 def test_tagged_segment_payload_requires_fact_id():
-    import pytest
     from corpusgen.graph_records import TaggedSegment
 
     with pytest.raises(ValueError, match="payload segments require fact_id"):
@@ -54,7 +83,6 @@ def test_tagged_segment_payload_requires_fact_id():
 
 
 def test_tagged_segment_non_payload_rejects_fact_id():
-    import pytest
     from corpusgen.graph_records import TaggedSegment
 
     with pytest.raises(ValueError, match="only payload segments may carry fact_id"):

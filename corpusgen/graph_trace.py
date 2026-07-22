@@ -31,6 +31,8 @@ def serialize_return(row: GraphRow | None, fact_id: str | None):
             TaggedSegment("<|graph_miss|>", "action"),
             TaggedSegment("<|graph_end|>", "action"),
         ]
+    if fact_id is None:
+        raise ValueError("hit returns require fact_id")
     payload = json.dumps(
         {
             "target_kind": row.target_kind,
