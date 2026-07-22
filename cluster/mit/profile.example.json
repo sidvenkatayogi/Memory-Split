@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "partition": "chosen_partition",
+  "account": null,
+  "qos": null,
+  "gres": "gpu:1",
+  "gpu_name_regex": "H100|H200|L40S|A100",
+  "cpus": 16,
+  "memory_gb": 96,
+  "wall_minutes": 360,
+  "python": "${RELATIONAL_VENV}/bin/python"
+}

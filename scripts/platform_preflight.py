@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -24,6 +25,7 @@ import yaml
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from cluster.mit.profile import MITProfile, load_profile  # noqa: E402
 from scripts.make_relational_manifest import (  # noqa: E402
     ROUTE_POLICY_SHA256,
     make_jobs,
@@ -47,6 +49,9 @@ H100_USABLE_MEMORY_MIB = 72 * 1024
 AWS_THROUGHPUT_MIN = 60_000.0
 AWS_WARMUP_STEPS = 50
 AWS_PROBE_STEPS = 200
+MIT_WARMUP_STEPS = 50
+MIT_PROBE_STEPS = 200
+MIT_EVIDENCE_NAME = "mit-job-evidence.json"
 RESUME_TOLERANCE = 1e-5
 LEARNABILITY_THRESHOLD = 0.75
 LEARNABILITY_PAIRS_PER_TASK = 10_000
@@ -76,6 +81,7 @@ _SOURCE_PREFIXES = (
     "corpusgen/",
     "evals/",
     "organizer/",
+    "schemas/",
     "scripts/",
     "tests/",
     "train/",
@@ -222,6 +228,8 @@ class LiveProbe:
     ) -> ResumeInfo:
         if platform == "aws":
             return _aws_checkpoint_resume_info(runs_root)
+        if platform == "mit":
+            return _mit_checkpoint_resume_info(runs_root)
         with tempfile.TemporaryDirectory(prefix="relational-resume-") as raw:
             report = run_smoke(Path(raw) / "smoke", device="cpu")
         exact = report == _GREEN_SMOKE_REPORT
@@ -406,6 +414,7 @@ def verify_bundle(
         "smoke_report": smoke_report,
         "member_count": len(indexed),
         "tokenizer_assets": len(_TOKENIZER_ASSETS),
+        "archive_sha256": _sha256_file(Path(bundle)),
     }
 
 
@@ -588,6 +597,17 @@ def _aws_checkpoint_resume_info(
     )
 
 
+def _mit_checkpoint_resume_info(
+    runs_root: Path | str | None,
+) -> ResumeInfo:
+    """Use the same deterministic 200-step checkpoint probe on MIT."""
+
+    try:
+        return _aws_checkpoint_resume_info(runs_root)
+    except ValueError as error:
+        raise ValueError(str(error).replace("AWS", "MIT")) from error
+
+
 def _resume_detail(
     probe,
     *,
@@ -596,17 +616,24 @@ def _resume_detail(
 ) -> dict:
     resume = probe.resume_info(platform=platform, runs_root=runs_root)
     expected_steps = (
-        AWS_PROBE_STEPS if platform == "aws" else SMOKE_STEPS
+        AWS_PROBE_STEPS
+        if platform == "aws"
+        else MIT_PROBE_STEPS
+        if platform == "mit"
+        else SMOKE_STEPS
     )
     if (
         resume.steps != expected_steps
         or not math.isfinite(resume.next_loss_delta)
         or resume.next_loss_delta > RESUME_TOLERANCE
-        or (platform != "aws" and resume.exact is not True)
+        or (
+            platform not in ("aws", "mit")
+            and resume.exact is not True
+        )
     ):
         message = (
             "requires finite next_loss_delta <= 1e-5"
-            if platform == "aws"
+            if platform in ("aws", "mit")
             else "must be exact with finite next_loss_delta <= 1e-5"
         )
         raise ValueError(f"{expected_steps}-step checkpoint resume {message}")
@@ -640,6 +667,23 @@ def _aws_gpu_detail(probe) -> dict:
     ):
         raise ValueError("every H100 requires 72GiB usable memory")
     return {"devices": [asdict(device) for device in devices]}
+
+
+def _mit_gpu_detail(probe, profile: MITProfile) -> dict:
+    devices = probe.gpu_info()
+    if len(devices) != 1:
+        raise ValueError("MIT requires exactly one visible GPU")
+    device = devices[0]
+    if re.search(profile.gpu_name_regex, device.name) is None:
+        raise ValueError(
+            "visible MIT GPU does not match the frozen profile regex"
+        )
+    if device.total_memory_mib <= 0 or device.free_memory_mib < 0:
+        raise ValueError("MIT GPU memory evidence is invalid")
+    return {
+        "gpu_name_regex": profile.gpu_name_regex,
+        "devices": [asdict(device)],
+    }
 
 
 def _disk_detail(probe, root: Path | str | None, minimum: int) -> dict:
@@ -1056,10 +1100,301 @@ def _aws_run_evidence(runs_root: Path | str | None) -> dict:
     }
 
 
+def _mit_run_evidence(
+    runs_root: Path | str | None,
+    *,
+    data_root: Path | str | None,
+    profile: MITProfile,
+    bundle_sha256: str,
+) -> dict:
+    if runs_root is None:
+        raise ValueError("MIT runs root is required")
+    root = _existing_root(runs_root, label="MIT runs root")
+    data_base = _existing_root(data_root, label="MIT data root")
+    runtime_root = root / ".launch-configs"
+    if not runtime_root.is_dir() or runtime_root.is_symlink():
+        raise ValueError("MIT runtime-config directory is missing or unsafe")
+    if profile.wall_minutes <= max(
+        int(job["ckpt_minutes"]) for job in make_jobs("360m")
+    ):
+        raise ValueError(
+            "MIT wall time must exceed the checkpoint interval"
+        )
+
+    expected_fields = {
+        "schema_version",
+        "platform",
+        "status",
+        "config_rel",
+        "config_sha256",
+        "run_id",
+        "profile_sha256",
+        "bundle_sha256",
+        "slurm",
+        "gpu",
+        "max_steps",
+        "steps_completed",
+        "returncode",
+        "oom_detected",
+        "checkpoint_present",
+        "peak_memory_mib",
+        "runtime_config",
+    }
+    expected_gpu_fields = {
+        "count",
+        "name",
+        "total_memory_mib",
+        "free_memory_mib",
+    }
+    expected_slurm_fields = {"job_id", "version"}
+    run_details = {}
+    throughput_runs = {}
+    all_throughputs = []
+    checkpoint_identities = set()
+    evidence_identities = set()
+    slurm_versions = set()
+    repository = Path(__file__).resolve().parents[1]
+
+    for job in make_jobs("360m"):
+        run_id = job["run_id"]
+        relative = f"configs/360m/{run_id}.yaml"
+        run_dir, _ = _safe_path_identity(
+            root,
+            root / job["out_rel"],
+            label=f"{run_id} run directory",
+            kind="directory",
+        )
+        evidence_path, evidence_identity = _safe_path_identity(
+            root,
+            run_dir / MIT_EVIDENCE_NAME,
+            label=f"{run_id} MIT evidence",
+            kind="regular file",
+        )
+        if evidence_identity in evidence_identities:
+            raise ValueError("MIT job evidence files must be distinct")
+        evidence_identities.add(evidence_identity)
+        evidence = _read_unique_json_object(evidence_path)
+        if set(evidence) != expected_fields:
+            raise ValueError(f"{run_id}: MIT evidence fields are not exact")
+        if (
+            evidence["schema_version"] != 1
+            or isinstance(evidence["schema_version"], bool)
+            or evidence["platform"] != "mit"
+            or evidence["status"] != "completed"
+            or evidence["config_rel"] != relative
+            or evidence["run_id"] != run_id
+            or evidence["profile_sha256"] != profile.sha256
+            or evidence["bundle_sha256"] != bundle_sha256
+            or evidence["max_steps"] != MIT_PROBE_STEPS
+            or isinstance(evidence["max_steps"], bool)
+            or evidence["steps_completed"] != MIT_PROBE_STEPS
+            or isinstance(evidence["steps_completed"], bool)
+            or evidence["returncode"] != 0
+            or isinstance(evidence["returncode"], bool)
+            or evidence["oom_detected"] is not False
+            or evidence["checkpoint_present"] is not True
+        ):
+            raise ValueError(
+                f"{run_id}: MIT evidence is incomplete or mismatched"
+            )
+
+        config_path = repository / relative
+        if not config_path.is_file() or config_path.is_symlink():
+            raise ValueError(f"{run_id}: frozen config is missing or unsafe")
+        if evidence["config_sha256"] != _sha256_file(config_path):
+            raise ValueError(f"{run_id}: frozen config hash is mismatched")
+
+        slurm = evidence["slurm"]
+        if (
+            not isinstance(slurm, Mapping)
+            or set(slurm) != expected_slurm_fields
+            or not isinstance(slurm["job_id"], str)
+            or not slurm["job_id"]
+            or not isinstance(slurm["version"], str)
+            or not slurm["version"].strip()
+        ):
+            raise ValueError(f"{run_id}: Slurm evidence is incomplete")
+        slurm_versions.add(slurm["version"])
+
+        gpu = evidence["gpu"]
+        if (
+            not isinstance(gpu, Mapping)
+            or set(gpu) != expected_gpu_fields
+            or gpu["count"] != 1
+            or isinstance(gpu["count"], bool)
+            or not isinstance(gpu["name"], str)
+            or re.search(profile.gpu_name_regex, gpu["name"]) is None
+        ):
+            raise ValueError(
+                f"{run_id}: GPU evidence does not match the profile"
+            )
+        for field, allow_zero in (
+            ("total_memory_mib", False),
+            ("free_memory_mib", True),
+        ):
+            value = gpu[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < int(not allow_zero)
+            ):
+                raise ValueError(f"{run_id}: GPU memory evidence is invalid")
+
+        peak = evidence["peak_memory_mib"]
+        if (
+            isinstance(peak, bool)
+            or not isinstance(peak, (int, float))
+            or not math.isfinite(float(peak))
+            or float(peak) <= 0
+        ):
+            raise ValueError(f"{run_id}: peak memory evidence is missing")
+
+        runtime_value = evidence["runtime_config"]
+        if not isinstance(runtime_value, str):
+            raise ValueError(f"{run_id}: runtime config path is invalid")
+        runtime_config, _ = _safe_path_identity(
+            root,
+            Path(runtime_value),
+            label=f"{run_id} runtime config",
+            kind="regular file",
+        )
+        try:
+            runtime_config.relative_to(runtime_root)
+        except ValueError as error:
+            raise ValueError(
+                f"{run_id}: runtime config is outside .launch-configs"
+            ) from error
+        expected_runtime = resolve_job(
+            job,
+            data_root=data_base,
+            out_root=root,
+            max_steps=MIT_PROBE_STEPS,
+        )
+        runtime = yaml.safe_load(runtime_config.read_text())
+        if not isinstance(runtime, dict):
+            raise ValueError(f"{run_id}: runtime config is not a mapping")
+        _exact_runtime_config(job, runtime, expected_runtime)
+
+        saved_config, _ = _safe_path_identity(
+            root,
+            run_dir / "config.yaml",
+            label=f"{run_id} saved config",
+            kind="regular file",
+        )
+        saved = yaml.safe_load(saved_config.read_text())
+        if not isinstance(saved, dict):
+            raise ValueError(f"{run_id}: saved config is not a mapping")
+        _exact_runtime_config(job, saved, expected_runtime)
+
+        checkpoint, checkpoint_identity = _safe_path_identity(
+            root,
+            run_dir / "ckpt.pt",
+            label=f"{run_id} checkpoint",
+            kind="regular file",
+        )
+        if checkpoint_identity in checkpoint_identities:
+            raise ValueError("MIT probe checkpoints must be distinct")
+        checkpoint_identities.add(checkpoint_identity)
+        if not checkpoint.is_file():
+            raise ValueError(f"{run_id}: checkpoint is missing")
+
+        log_path, _ = _safe_path_identity(
+            root,
+            run_dir / "log.jsonl",
+            label=f"{run_id} training log",
+            kind="regular file",
+        )
+        rows = []
+        for line_number, line in enumerate(
+            log_path.read_text().splitlines(),
+            start=1,
+        ):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"{run_id}: malformed log row {line_number}"
+                ) from error
+            if not isinstance(row, Mapping):
+                raise ValueError(f"{run_id}: log row is not an object")
+            rows.append(row)
+        steps = [
+            row.get("step")
+            for row in rows
+            if isinstance(row.get("step"), int)
+            and not isinstance(row.get("step"), bool)
+        ]
+        if not steps or max(steps) != MIT_PROBE_STEPS:
+            raise ValueError(f"{run_id}: probe did not complete 200 steps")
+        throughputs = []
+        for row in rows:
+            step = row.get("step")
+            if (
+                not isinstance(step, int)
+                or isinstance(step, bool)
+                or not MIT_WARMUP_STEPS < step <= MIT_PROBE_STEPS
+                or "tok_s" not in row
+            ):
+                continue
+            value = row["tok_s"]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{run_id}: throughput is not numeric")
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric <= 0:
+                raise ValueError(f"{run_id}: throughput is not positive")
+            throughputs.append(numeric)
+        if not throughputs:
+            raise ValueError(
+                f"{run_id}: post-warmup throughput evidence is missing"
+            )
+        mean = sum(throughputs) / len(throughputs)
+        projected_hours = float(job["total_tokens"]) / mean / 3600.0
+        projected_resubmissions = math.ceil(
+            projected_hours * 60.0 / profile.wall_minutes
+        )
+        all_throughputs.extend(throughputs)
+        throughput_runs[run_id] = {
+            "mean_raw_tokens_per_second_per_gpu": mean,
+            "samples": len(throughputs),
+            "projected_full_hours": projected_hours,
+            "projected_resubmissions": projected_resubmissions,
+        }
+        run_details[run_id] = {
+            "evidence": str(evidence_path),
+            "checkpoint": str(checkpoint),
+            "steps_completed": MIT_PROBE_STEPS,
+            "peak_memory_mib": float(peak),
+            "gpu": dict(gpu),
+        }
+
+    if len(slurm_versions) != 1:
+        raise ValueError("MIT probe Slurm versions are inconsistent")
+    return {
+        "runs": run_details,
+        "slurm_version": next(iter(slurm_versions)),
+        "profile_sha256": profile.sha256,
+        "bundle_sha256": bundle_sha256,
+        "throughput": {
+            "mean_raw_tokens_per_second_per_gpu": (
+                sum(all_throughputs) / len(all_throughputs)
+            ),
+            "samples": len(all_throughputs),
+            "measurement": (
+                "checkpoint-inclusive post-warmup logged raw throughput"
+            ),
+            "threshold": None,
+            "runs": throughput_runs,
+        },
+    }
+
+
 def run_preflight(
     platform: str,
     *,
     bundle: Path | str,
+    profile: Path | str | None = None,
     probe=None,
     source_root: Path | str | None = None,
     data_root: Path | str | None = None,
@@ -1069,7 +1404,7 @@ def run_preflight(
 ) -> dict:
     """Run every required check and return all failures without exceptions."""
 
-    if platform not in ("local", "farmshare", "aws"):
+    if platform not in ("local", "farmshare", "aws", "mit"):
         raise ValueError(f"unknown platform: {platform}")
     probe = probe or LiveProbe()
     checks = {}
@@ -1112,7 +1447,28 @@ def run_preflight(
         ),
     )
 
-    if platform in ("farmshare", "aws"):
+    mit_profile_cache = {}
+    profile_evidence = None
+    if platform == "mit":
+        def mit_profile_detail():
+            if profile is None:
+                raise ValueError("MIT profile is required")
+            loaded = load_profile(profile)
+            mit_profile_cache["value"] = loaded
+            return {
+                "sha256": loaded.sha256,
+                "profile": loaded.as_dict(),
+            }
+
+        profile_evidence = record("profile", mit_profile_detail)
+
+    def mit_profile() -> MITProfile:
+        value = mit_profile_cache.get("value")
+        if value is None:
+            raise ValueError("validated MIT profile is unavailable")
+        return value
+
+    if platform in ("farmshare", "aws", "mit"):
         record(
             "gpu_command",
             lambda: (
@@ -1228,12 +1584,50 @@ def run_preflight(
         record("throughput", throughput_detail)
         record("peak_memory", peak_detail)
 
+    if platform == "mit":
+        required_slurm = ("sbatch", "scontrol", "sinfo")
+        record(
+            "slurm",
+            lambda: (
+                {"commands": list(required_slurm)}
+                if all(probe.has_command(command) for command in required_slurm)
+                else (_ for _ in ()).throw(
+                    ValueError("required Slurm commands are unavailable")
+                )
+            ),
+        )
+        record("gpu", lambda: _mit_gpu_detail(probe, mit_profile()))
+        mit_evidence_cache = {}
+
+        def mit_evidence():
+            if "value" not in mit_evidence_cache:
+                if bundle_evidence is None:
+                    raise ValueError("verified bundle hash is unavailable")
+                mit_evidence_cache["value"] = _mit_run_evidence(
+                    runs_root,
+                    data_root=data_root,
+                    profile=mit_profile(),
+                    bundle_sha256=bundle_evidence["archive_sha256"],
+                )
+            return mit_evidence_cache["value"]
+
+        record(
+            "mit_runs",
+            lambda: {
+                key: value
+                for key, value in mit_evidence().items()
+                if key != "throughput"
+            },
+        )
+        record("throughput", lambda: mit_evidence()["throughput"])
+
     report = {
         "schema_version": 1,
         "platform": platform,
         "ok": all(check["passed"] for check in checks.values()),
         "checks": checks,
         "bundle": bundle_evidence,
+        "profile": profile_evidence,
     }
     return report
 
@@ -1245,7 +1639,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--platform",
         required=True,
-        choices=("local", "farmshare", "aws"),
+        choices=("local", "farmshare", "aws", "mit"),
     )
     parser.add_argument(
         "--bundle",
@@ -1255,6 +1649,7 @@ def main(argv: list[str] | None = None) -> int:
         "--source-root",
         default=str(Path(__file__).resolve().parents[1]),
     )
+    parser.add_argument("--profile")
     parser.add_argument("--data-root", default=os.environ.get("DATA_ROOT"))
     parser.add_argument("--out-root", default=os.environ.get("OUT_ROOT"))
     parser.add_argument("--runs-root")
@@ -1274,11 +1669,12 @@ def main(argv: list[str] | None = None) -> int:
         else LiveProbe()
     )
     runs_root = args.runs_root or (
-        args.out_root if args.platform == "aws" else None
+        args.out_root if args.platform in ("aws", "mit") else None
     )
     report = run_preflight(
         args.platform,
         bundle=args.bundle,
+        profile=args.profile,
         probe=probe,
         source_root=args.source_root,
         data_root=args.data_root,

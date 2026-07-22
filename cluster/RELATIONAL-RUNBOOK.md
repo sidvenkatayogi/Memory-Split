@@ -2,9 +2,9 @@
 
 This runbook is the execution gate for the standard-GPT relational experiment.
 The checked-in `configs/160m.tsv` and `configs/360m.tsv` are platform-neutral:
-FarmShare and AWS consume those same YAML bytes. Each YAML contains only
-`data_rel` and `out_rel`; launchers resolve them against `DATA_ROOT` and
-`OUT_ROOT` immediately before `scripts/run_train.py`.
+FarmShare, MIT Slurm, and the retained AWS tooling consume those same YAML
+bytes. Each YAML contains only `data_rel` and `out_rel`; launchers resolve them
+against `DATA_ROOT` and `OUT_ROOT` immediately before `scripts/run_train.py`.
 
 Do not hand-edit a generated config, replace a missing seed, use Spot, or run a
 launcher before its preflight is entirely green. Launch commands are dry-runs
@@ -147,9 +147,92 @@ The Slurm script resolves roots into a runtime config and invokes
 requeue-enabled. Rerunning the same relative config resumes its existing
 `OUT_ROOT/out_rel/ckpt.pt`.
 
-## 3. AWS preferred: six concurrent 360M jobs
+## 3. MIT Slurm required: six 360M jobs
 
-AWS is preferred only for the six 360M confirmation runs. Use one
+The approved 360M route is a generic MIT student Slurm cluster. Do not assume a
+partition, account, QoS, GPU model, wall time, module stack, or filesystem root.
+On the login node, collect only bounded read-only discovery facts:
+
+```bash
+python cluster/mit/probe_cluster.py \
+  --out mit-cluster-probe.json \
+  --bundle artifacts/relational-run.tar.gz
+```
+
+This runs only `sinfo --version`, the fixed partition-format `sinfo` query, and
+`scontrol show config`. It also records local module, Python, scratch,
+filesystem, source-revision, and optional bundle-hash facts. It never allocates
+a node or submits a job.
+
+Copy `cluster/mit/profile.example.json` to a reviewed, committed profile and
+fill it from one discovered option. The closed schema is
+`schemas/mit-cluster-profile-v1.schema.json`. The profile must request exactly
+one GPU and must retain:
+
+```json
+{"python": "${RELATIONAL_VENV}/bin/python"}
+```
+
+Set only launch-time roots on MIT:
+
+```bash
+export DATA_ROOT=/absolute/path/to/relational-data
+export OUT_ROOT=/absolute/path/to/relational-runs
+export RELATIONAL_VENV=/absolute/path/to/relational-venv
+```
+
+Preview all six 200-step jobs. This only prints deterministic `sbatch` argv:
+
+```bash
+"$RELATIONAL_VENV/bin/python" cluster/mit/run_relational_manifest.py \
+  configs/360m.tsv \
+  --profile cluster/mit/profile.json \
+  --bundle artifacts/relational-run.tar.gz \
+  --steps 200
+```
+
+After reviewing the commands, explicitly submit the resumable probe:
+
+```bash
+"$RELATIONAL_VENV/bin/python" cluster/mit/run_relational_manifest.py \
+  configs/360m.tsv \
+  --profile cluster/mit/profile.json \
+  --bundle artifacts/relational-run.tar.gz \
+  --steps 200 \
+  --execute
+```
+
+The generic script verifies exactly one profile-matching visible GPU, writes a
+runtime config, records `$OUT_ROOT/<run_id>/mit-job-evidence.json`, and runs the
+standard GPT through `scripts/run_train.py --resume auto`. Wait for all six
+probe jobs, then run preflight inside a one-GPU allocation:
+
+```bash
+"$RELATIONAL_VENV/bin/python" scripts/platform_preflight.py \
+  --platform mit \
+  --profile cluster/mit/profile.json \
+  --bundle artifacts/relational-run.tar.gz \
+  --data-root "$DATA_ROOT" \
+  --out-root "$OUT_ROOT" \
+  --runs-root "$OUT_ROOT"
+```
+
+Preflight requires matching profile, bundle, config, route-policy, and corpus
+hashes; one matching GPU per job; six successful 200-step logs; no OOM;
+positive peak-memory evidence; a checkpoint; and next-loss resume delta at or
+below `1e-5`. It reports mean post-warmup raw tokens/s, projected full-run
+hours, and projected checkpointed resubmissions. Unknown MIT hardware has no
+fixed throughput threshold.
+
+After preflight is entirely green, preview and explicitly submit the full
+resumable jobs by repeating the launcher without `--steps 200`. Every one of
+the six submissions is attempted; a partial submission failure makes the
+launcher exit nonzero after the final attempt.
+
+## 4. Retained AWS tooling (not the approved 360M route)
+
+The AWS launcher remains available for reproducibility but is not the approved
+route for this study. If a separately approved run uses it, use one
 `p5.48xlarge` with exactly eight visible H100 80 GB GPUs. Use On-Demand or an
 EC2 Capacity Block; never use Spot for these protected runs. This runbook does
 not provision or contact AWS.

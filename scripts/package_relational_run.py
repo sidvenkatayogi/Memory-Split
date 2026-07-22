@@ -48,9 +48,16 @@ _TASK5_SOURCE = {
 _TASK6_SOURCE = {
     "cluster/RELATIONAL-RUNBOOK.md",
     "cluster/aws/run_relational_manifest.py",
+    "cluster/mit/probe_cluster.py",
+    "cluster/mit/profile.example.json",
+    "cluster/mit/profile.py",
+    "cluster/mit/run_relational_manifest.py",
+    "cluster/slurm/relational_mit_train.sbatch",
     "cluster/slurm/relational_train.sbatch",
+    "schemas/mit-cluster-profile-v1.schema.json",
     "scripts/make_relational_manifest.py",
     "scripts/platform_preflight.py",
+    "tests/test_mit_cluster.py",
     "tests/test_platform_preflight.py",
     "tests/test_relational_manifest.py",
 }

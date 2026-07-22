@@ -1,0 +1,76 @@
+{
+  "$id": "https://memorysplit.dev/schemas/mit-cluster-profile-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cpus": {
+      "maximum": 1024,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "gpu_name_regex": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9 _.|()+-]{0,127}$",
+      "type": "string"
+    },
+    "gres": {
+      "pattern": "^gpu(?::[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?:1$",
+      "type": "string"
+    },
+    "memory_gb": {
+      "maximum": 1048576,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "partition": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "type": "string"
+    },
+    "python": {
+      "const": "${RELATIONAL_VENV}/bin/python"
+    },
+    "qos": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "wall_minutes": {
+      "maximum": 43200,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "partition",
+    "gres",
+    "gpu_name_regex",
+    "cpus",
+    "memory_gb",
+    "wall_minutes",
+    "python"
+  ],
+  "title": "MIT Slurm cluster profile v1",
+  "type": "object"
+}
