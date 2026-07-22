@@ -74,13 +74,20 @@ def main() -> None:
     loads = args.loads or STAGE_DEFAULT_LOADS[args.stage]
     tag = STAGE_DIR_TAG[args.stage]
     for load in loads.split(","):
+        # Each spawned worker regenerates the full record set at init;
+        # at multi-million entities that is ~1-2 GB per worker, which
+        # OOM-killed a 16-worker n4m build (job 1649440). Cap workers so
+        # worker-resident records stay bounded.
+        workers = args.workers
+        if LOADS[load] >= 2_000_000:
+            workers = min(workers, 6)
         out_dir = Path(args.out_root) / (load + tag)
         out_dir.mkdir(parents=True, exist_ok=True)
         cfg = BuildCfg(
             n_entities=LOADS[load],
             total_tokens=total,
             seed=args.seed,
-            workers=args.workers,
+            workers=workers,
         )
         bed = bed_iter_file(args.bed_file) if args.bed_file else bed_iter_hf()
         report = build_corpus(cfg, tok, bed, out_dir)
