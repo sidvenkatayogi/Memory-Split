@@ -8,14 +8,19 @@ import argparse
 
 import yaml
 
-from train.trainer import train
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--resume", default="auto", choices=["auto", "none"])
+    ap.add_argument("--trainer", default="v1", choices=["v1", "v2"],
+                    help="v2 = token-weighted gradient accumulation (use for the "
+                         "split arm; a no-op for dense). See train/trainer_v2.py.")
     args = ap.parse_args()
+    if args.trainer == "v2":
+        from train.trainer_v2 import train
+    else:
+        from train.trainer import train
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     trainer = train(cfg, resume=args.resume)
