@@ -231,8 +231,42 @@ def test_bed_and_graph_renderers_are_lazy_over_their_inputs():
     neutral = graph_record.segments[-1]
     assert graph_record.schedule.component == "graph"
     assert payload.fact_id is not None
-    assert neutral.role == "plain"
+    assert neutral.role == "random_control"
     assert len(tok.encode(neutral.text)) == len(tok.encode(payload.text))
+
+
+def test_graph_controls_counterbalance_length_and_position_bins():
+    tok = get_tok()
+    world = generate_world(0, WorldConfig(n_entities=16, seed=31))
+    records = list(
+        islice(
+            iter_graph_records(tok, lambda: iter((world,))),
+            2,
+        )
+    )
+    payload_keys = Counter()
+    control_keys = Counter()
+
+    for record in records:
+        encoded = [
+            (segment, tok.encode(segment.text))
+            for segment in record.segments
+        ]
+        document_length = sum(len(ids) for _, ids in encoded) + 1
+        start = 0
+        for segment, ids in encoded:
+            end = start + len(ids)
+            key = (
+                len(ids),
+                min(9, ((start + end) * 10) // (2 * document_length)),
+            )
+            if segment.role == "payload":
+                payload_keys[key] += 1
+            elif segment.role == "random_control":
+                control_keys[key] += 1
+            start = end
+
+    assert payload_keys == control_keys
 
 
 @pytest.mark.parametrize("hop_band", [1, 2, 4])
@@ -362,12 +396,46 @@ def test_reasoning_records_cover_every_task_with_post_halt_noops_and_controls():
                 if segment.role == "payload"
             )
             assert payload.text == expected_payload.text
-            assert record.segments[index + 1].text == "<|graph_end|>"
-            neutral = record.segments[index + 2]
-            assert neutral.role == "plain"
-            assert len(tok.encode(neutral.text)) == len(
-                tok.encode(payload.text)
-            )
+            matching_controls = [
+                segment
+                for segment in record.segments
+                if segment.role == "random_control"
+                and len(tok.encode(segment.text))
+                == len(tok.encode(payload.text))
+            ]
+            assert matching_controls
+
+
+def test_reasoning_controls_use_both_counterbalanced_orientations():
+    tok = get_tok()
+    world = generate_world(0, WorldConfig(n_entities=64, seed=43))
+    records = list(
+        islice(
+            iter_reasoning_records(
+                tok,
+                lambda: iter((world,)),
+                seed=47,
+                max_hops=1,
+            ),
+            2,
+        )
+    )
+    orientations = set()
+
+    for record in records:
+        payload_index = next(
+            index
+            for index, segment in enumerate(record.segments)
+            if segment.role == "payload"
+        )
+        control_index = next(
+            index
+            for index, segment in enumerate(record.segments)
+            if segment.role == "random_control"
+        )
+        orientations.add("control_first" if control_index < payload_index else "payload_first")
+
+    assert orientations == {"control_first", "payload_first"}
 
 
 def test_reasoning_renderer_rejects_non_curriculum_hop_bands():

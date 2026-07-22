@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -12,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from corpusgen import relational_build as relational
 from corpusgen.relational_build import (
     EncodedSpan,
     FactCost,
@@ -62,18 +64,110 @@ def test_split_and_random_weights_mask_only_their_allowed_spans():
         expected_hops=0,
     )
     spans = [
-        EncodedSpan(0, 3, "payload", "external", external),
-        EncodedSpan(3, 5, "action"),
-        EncodedSpan(5, 8, "plain"),
-        EncodedSpan(8, 9, "final_answer"),
+        EncodedSpan(0, 10, "action"),
+        EncodedSpan(10, 13, "payload", "external", external),
+        EncodedSpan(13, 15, "action"),
+        EncodedSpan(15, 18, "random_control"),
+        EncodedSpan(18, 25, "rule"),
+        EncodedSpan(25, 35, "provisional_answer"),
+        EncodedSpan(35, 50, "action"),
+        EncodedSpan(50, 53, "plain"),
+        EncodedSpan(53, 100, "final_answer"),
     ]
     policy = RoutePolicy(write_cost=1)
 
     split = derive_weights("split", spans, policy, random.Random(7))
     random_control = derive_weights("random", spans, policy, random.Random(7))
 
-    assert split.tolist() == [0, 0, 0, 1, 1, 1, 1, 1, 1]
-    assert random_control.tolist() == [1, 1, 1, 1, 1, 0, 0, 0, 1]
+    assert np.flatnonzero(split == 0).tolist() == [10, 11, 12]
+    assert np.flatnonzero(random_control == 0).tolist() == [15, 16, 17]
+    assert random_control[50:53].tolist() == [1, 1, 1]
+
+
+def test_random_matching_samples_deterministically_within_exact_key_pool():
+    external = FactCost(
+        "external",
+        entropy=12,
+        exposures=1,
+        expected_reads=0,
+        expected_hops=0,
+    )
+    spans = [
+        EncodedSpan(0, 10, "action"),
+        EncodedSpan(10, 13, "payload", "external", external),
+        EncodedSpan(13, 15, "action"),
+        EncodedSpan(15, 18, "random_control"),
+        EncodedSpan(18, 21, "random_control"),
+        EncodedSpan(21, 100, "action"),
+    ]
+    policy = RoutePolicy(write_cost=1)
+
+    first = derive_weights("random", spans, policy, random.Random(23))
+    second = derive_weights("random", spans, policy, random.Random(23))
+
+    assert np.array_equal(first, second)
+    assert np.flatnonzero(first == 0).tolist() in (
+        [15, 16, 17],
+        [18, 19, 20],
+    )
+
+
+def test_expected_external_ranges_are_collected_before_weight_derivation():
+    external = FactCost(
+        "external",
+        entropy=12,
+        exposures=1,
+        expected_reads=0,
+        expected_hops=0,
+    )
+    spans = [
+        EncodedSpan(0, 5, "action"),
+        EncodedSpan(5, 8, "payload", "external", external),
+        EncodedSpan(8, 12, "plain"),
+    ]
+
+    expected = relational.collect_expected_external_ranges(
+        spans,
+        RoutePolicy(write_cost=1),
+    )
+
+    assert [(item.start, item.end, item.fact_id) for item in expected] == [
+        (5, 8, "external")
+    ]
+
+
+def test_split_coverage_validation_rejects_missing_or_extra_zeros():
+    external = FactCost(
+        "external",
+        entropy=12,
+        exposures=1,
+        expected_reads=0,
+        expected_hops=0,
+    )
+    spans = [
+        EncodedSpan(0, 5, "action"),
+        EncodedSpan(5, 8, "payload", "external", external),
+        EncodedSpan(8, 12, "plain"),
+    ]
+    expected = relational.collect_expected_external_ranges(
+        spans,
+        RoutePolicy(write_cost=1),
+    )
+
+    with pytest.raises(ValueError, match="expected external payload"):
+        relational.validate_split_coverage(
+            expected,
+            spans,
+            np.ones(12, dtype=np.uint8),
+            [],
+        )
+
+    weights = np.ones(12, dtype=np.uint8)
+    weights[5:8] = 0
+    weights[9] = 0
+    actual = [(5, 8, spans[1])]
+    with pytest.raises(ValueError, match="protected nonpayload"):
+        relational.validate_split_coverage(expected, spans, weights, actual)
 
 
 def test_record_encoding_rejects_token_ids_outside_uint16():
@@ -92,6 +186,19 @@ def test_record_encoding_rejects_token_ids_outside_uint16():
 
     with pytest.raises(ValueError, match="token id does not fit uint16"):
         _encode_record(OversizedTokenizer(), record, {})
+
+
+def test_eval_pair_count_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="eval_pairs_per_task must be positive",
+    ):
+        RelationalBuildConfig(
+            n_entities=64,
+            total_tokens=60_000,
+            data_seed=17,
+            eval_pairs_per_task=0,
+        )
 
 
 def _bed_stream():
@@ -150,11 +257,14 @@ def test_shared_stream_sidecars_are_aligned_and_checks_pass(built):
     assert (dense == 1).all()
     assert report["checks"] == {
         "external_payload_coverage": True,
+        "external_payload_ranges_exact": True,
         "random_mass_within_1pct": True,
         "random_span_histogram_within_1pct": True,
+        "random_position_histogram_within_1pct": True,
         "mixture_within_1pct": True,
         "graph_mixture_exact": True,
         "protected_roles_unmasked": True,
+        "eval_validity": True,
         "schedule_hash_stable": True,
         "sidecars_aligned": True,
         "manifests_relative": True,
@@ -204,20 +314,47 @@ def test_mask_ledger_proves_coverage_and_matched_random_histogram(built):
         mode="r",
     )
     ledger = _read_jsonl(out / "mask-ledger.jsonl")
+    expected_rows = [
+        row for row in ledger if row["condition"] == "expected_split"
+    ]
     split_rows = [row for row in ledger if row["condition"] == "split"]
     random_rows = [row for row in ledger if row["condition"] == "random"]
 
     assert split_rows
-    assert Counter(row["length"] for row in split_rows) == Counter(
-        row["length"] for row in random_rows
+    assert [
+        (row["start"], row["end"], row["fact_id"])
+        for row in expected_rows
+    ] == [
+        (row["start"], row["end"], row["fact_id"])
+        for row in split_rows
+    ]
+    assert all("position_bin" in row for row in split_rows + random_rows)
+    split_histogram = Counter(
+        (row["length"], row["position_bin"]) for row in split_rows
     )
-    assert int((split == 0).sum()) == int((random_control == 0).sum())
+    random_histogram = Counter(
+        (row["length"], row["position_bin"]) for row in random_rows
+    )
+    mismatch = sum(
+        abs(split_histogram[key] - random_histogram[key])
+        for key in set(split_histogram) | set(random_histogram)
+    )
+    assert mismatch / len(split_rows) <= 0.01
+    assert (
+        abs(int((split == 0).sum()) - int((random_control == 0).sum()))
+        / int((split == 0).sum())
+        <= 0.01
+    )
     for row in split_rows:
         assert row["role"] == "payload"
         assert not split[row["start"] : row["end"]].any()
     for row in random_rows:
-        assert row["role"] == "plain"
+        assert row["role"] == "random_control"
         assert not random_control[row["start"] : row["end"]].any()
+    selected_random_positions = np.zeros(len(random_control), dtype=bool)
+    for row in random_rows:
+        selected_random_positions[row["start"] : row["end"]] = True
+    assert np.array_equal(random_control == 0, selected_random_positions)
 
 
 def test_graph_policy_eval_and_manifests_are_portable(built):
@@ -225,6 +362,7 @@ def test_graph_policy_eval_and_manifests_are_portable(built):
     graph = _read_jsonl(out / "graph.jsonl")
     policy = json.loads((out / "route-policy.json").read_text())
     manifest = json.loads((out / "manifest.json").read_text())
+    eval_manifest = json.loads((out / "eval-manifest.json").read_text())
     originals = _read_jsonl(out / "eval" / "original.jsonl")
     counterfactuals = _read_jsonl(out / "eval" / "counterfactual.jsonl")
     eval_graph = _read_jsonl(out / "eval" / "graph.jsonl")
@@ -246,12 +384,45 @@ def test_graph_policy_eval_and_manifests_are_portable(built):
     assert {row["source_id"] for row in graph}.isdisjoint(
         {row["source_id"] for row in eval_graph}
     )
+    assert eval_manifest["checks"] == {
+        "exact_task_counts": True,
+        "two_variants_per_pair": True,
+        "answer_flips": True,
+        "changed_supporting_row": True,
+        "fresh_sources_disjoint": True,
+    }
 
     for artifact in manifest["artifacts"]:
         relative = Path(artifact["path"])
         assert not relative.is_absolute()
         assert ".." not in relative.parts
         assert _sha256(out / relative) == artifact["sha256"]
+
+
+def test_eval_validator_rejects_a_nonflipping_twin(built, tmp_path):
+    out, cfg, _ = built
+    copied = tmp_path / "eval-copy"
+    copied.mkdir()
+    for name in ("graph.jsonl", "original.jsonl", "counterfactual.jsonl"):
+        shutil.copy(out / "eval" / name, copied / name)
+    training_graph = tmp_path / "graph.jsonl"
+    shutil.copy(out / "graph.jsonl", training_graph)
+
+    counterfactuals = _read_jsonl(copied / "counterfactual.jsonl")
+    originals = _read_jsonl(copied / "original.jsonl")
+    counterfactuals[0]["answer"] = originals[0]["answer"]
+    (copied / "counterfactual.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in counterfactuals)
+    )
+
+    with pytest.raises(ValueError, match="answers must flip"):
+        relational.validate_eval_sets(
+            cfg,
+            training_graph,
+            copied / "graph.jsonl",
+            copied / "original.jsonl",
+            copied / "counterfactual.jsonl",
+        )
 
 
 def test_same_seed_rebuild_has_identical_artifact_hashes(built, tmp_path):

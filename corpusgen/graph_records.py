@@ -6,8 +6,31 @@ from typing import Literal
 Direction = Literal["out", "in"]
 TargetKind = Literal["entity", "literal"]
 SegmentRole = Literal[
-    "plain", "payload", "rule", "action", "provisional_answer", "final_answer"
+    "plain",
+    "payload",
+    "random_control",
+    "rule",
+    "action",
+    "provisional_answer",
+    "final_answer",
 ]
+RANDOM_CONTROL_POSITION_BINS = 10
+
+
+def relative_position_bin(
+    start: int,
+    end: int,
+    document_length: int,
+) -> int:
+    if not 0 <= start < end <= document_length:
+        raise ValueError("span must be non-empty and inside the document")
+    return min(
+        RANDOM_CONTROL_POSITION_BINS - 1,
+        (
+            (start + end) * RANDOM_CONTROL_POSITION_BINS
+        )
+        // (2 * document_length),
+    )
 
 
 @dataclass(frozen=True, order=True)

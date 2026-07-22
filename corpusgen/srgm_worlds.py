@@ -15,6 +15,7 @@ from corpusgen.graph_records import (
     ScheduleEntry,
     SelectorFeatures,
     TaggedSegment,
+    relative_position_bin,
 )
 from corpusgen.graph_trace import serialize_action, serialize_return
 from corpusgen.records import QAItem
@@ -694,6 +695,7 @@ def iter_graph_records(
     worlds_factory: Callable[[], Iterable[GraphWorld]],
 ) -> Iterator[RenderedRecord]:
     exposure = 0
+    placements_by_length: Counter[int] = Counter()
     rule_text = (
         "Composition adds retrieved compose codes modulo four. "
         "Inverse traversal reverses edge direction. Equality is symmetric. "
@@ -729,7 +731,24 @@ def iter_graph_records(
                 )
                 for fact in batch:
                     payload = _payload_text(fact.row)
-                    neutral = " the" * len(tok.encode(payload))
+                    payload_length = len(tok.encode(payload))
+                    neutral = " the" * payload_length
+                    payload_segment = TaggedSegment(
+                        payload,
+                        "payload",
+                        fact.fact_id,
+                    )
+                    control_segment = TaggedSegment(
+                        neutral,
+                        "random_control",
+                    )
+                    placement = placements_by_length[payload_length]
+                    placements_by_length[payload_length] += 1
+                    matched_segments = (
+                        (payload_segment, control_segment)
+                        if placement % 2 == 0
+                        else (control_segment, payload_segment)
+                    )
                     yield RenderedRecord(
                         segments=(
                             TaggedSegment(
@@ -739,12 +758,7 @@ def iter_graph_records(
                                 ),
                                 "plain",
                             ),
-                            TaggedSegment(
-                                payload,
-                                "payload",
-                                fact.fact_id,
-                            ),
-                            TaggedSegment(neutral, "plain"),
+                            *matched_segments,
                         ),
                         schedule=ScheduleEntry(
                             component="graph",
@@ -778,28 +792,116 @@ def _answer_segments(answer: str) -> tuple[TaggedSegment, ...]:
     )
 
 
-def _return_segments_with_control(
+def _return_segment_blocks(
     tok,
     row: GraphRow | None,
     fact_id: str | None,
-) -> tuple[TaggedSegment, ...]:
-    segments = list(serialize_return(row, fact_id))
+) -> tuple[tuple[TaggedSegment, ...], tuple[TaggedSegment, ...]]:
+    returned = tuple(serialize_return(row, fact_id))
     payload = next(
         (
             segment
-            for segment in segments
+            for segment in returned
             if segment.role == "payload"
         ),
         None,
     )
-    if payload is not None:
-        segments.append(
-            TaggedSegment(
-                " the" * len(tok.encode(payload.text)),
-                "plain",
+    if payload is None:
+        return returned, ()
+    control = (
+        TaggedSegment(" the", "plain"),
+        TaggedSegment(
+            " the" * len(tok.encode(payload.text)),
+            "random_control",
+        ),
+        TaggedSegment(" the", "plain"),
+    )
+    return returned, control
+
+
+def _counterbalance_control_blocks(
+    tok,
+    segments: list[TaggedSegment],
+    blocks: list[
+        tuple[
+            int,
+            tuple[TaggedSegment, ...],
+            tuple[TaggedSegment, ...],
+        ]
+    ],
+    balance: Counter[tuple[int, int]],
+    tie_offset: int,
+) -> None:
+    encoded_lengths = [len(tok.encode(segment.text)) for segment in segments]
+    encoded_length_by_id = {
+        id(segment): length
+        for segment, length in zip(segments, encoded_lengths)
+    }
+    offsets = [0]
+    for length in encoded_lengths:
+        offsets.append(offsets[-1] + length)
+    document_length = offsets[-1] + 1
+
+    def role_range(
+        block: tuple[TaggedSegment, ...],
+        role: str,
+        block_start: int,
+    ) -> tuple[int, int]:
+        local_start = 0
+        for segment in block:
+            length = encoded_length_by_id[id(segment)]
+            if segment.role == role:
+                return block_start + local_start, block_start + local_start + length
+            local_start += length
+        raise ValueError(f"block lacks role {role}")
+
+    def key(start: int, end: int) -> tuple[int, int]:
+        return (
+            end - start,
+            relative_position_bin(start, end, document_length),
+        )
+
+    for ordinal, (segment_index, returned, control) in enumerate(blocks):
+        block_start = offsets[segment_index]
+        returned_length = sum(
+            encoded_length_by_id[id(segment)] for segment in returned
+        )
+        control_length = sum(
+            encoded_length_by_id[id(segment)] for segment in control
+        )
+        if returned_length != control_length:
+            raise ValueError("payload and random-control blocks must align")
+        payload_key = key(*role_range(returned, "payload", block_start))
+        control_key = key(
+            *role_range(
+                control,
+                "random_control",
+                block_start + returned_length,
             )
         )
-    return tuple(segments)
+        normal_score = (
+            abs(balance[payload_key] + 1)
+            + abs(balance[control_key] - 1)
+        )
+        reverse_score = (
+            abs(balance[payload_key] - 1)
+            + abs(balance[control_key] + 1)
+        )
+        reverse = reverse_score < normal_score or (
+            reverse_score == normal_score
+            and (tie_offset + ordinal) % 2 == 1
+        )
+        if reverse:
+            block_size = len(returned) + len(control)
+            segments[segment_index : segment_index + block_size] = [
+                *control,
+                *returned,
+            ]
+            balance[payload_key] -= 1
+            balance[control_key] += 1
+        else:
+            balance[payload_key] += 1
+            balance[control_key] -= 1
 
 
 def iter_reasoning_records(
@@ -813,6 +915,7 @@ def iter_reasoning_records(
 
     rng = random.Random(seed)
     exposure = 0
+    control_position_balance: Counter[tuple[int, int]] = Counter()
     while True:
         saw_world = False
         for world in worlds_factory():
@@ -839,6 +942,13 @@ def iter_reasoning_records(
                 segments: list[TaggedSegment] = [
                     TaggedSegment(item.prompt, "plain")
                 ]
+                matched_blocks: list[
+                    tuple[
+                        int,
+                        tuple[TaggedSegment, ...],
+                        tuple[TaggedSegment, ...],
+                    ]
+                ] = []
                 for step in range(6):
                     if step < len(addresses):
                         address = addresses[step]
@@ -865,12 +975,16 @@ def iter_reasoning_records(
                                 "action",
                             )
                         )
-                        segments.extend(
-                            _return_segments_with_control(
-                                tok,
-                                fact.row,
-                                fact.fact_id,
-                            )
+                        returned, control = _return_segment_blocks(
+                            tok,
+                            fact.row,
+                            fact.fact_id,
+                        )
+                        block_start = len(segments)
+                        segments.extend(returned)
+                        segments.extend(control)
+                        matched_blocks.append(
+                            (block_start, returned, control)
                         )
                     else:
                         is_halt_step = step == len(addresses)
@@ -887,13 +1001,19 @@ def iter_reasoning_records(
                                 "action",
                             )
                         )
-                        segments.extend(
-                            _return_segments_with_control(tok, None, None)
-                        )
+                        returned, _ = _return_segment_blocks(tok, None, None)
+                        segments.extend(returned)
                     segments.extend(_answer_segments(item.answer))
 
                 segments.append(
                     TaggedSegment(item.answer, "final_answer")
+                )
+                _counterbalance_control_blocks(
+                    tok,
+                    segments,
+                    matched_blocks,
+                    control_position_balance,
+                    exposure,
                 )
                 yield RenderedRecord(
                     segments=tuple(segments),

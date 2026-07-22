@@ -6,12 +6,17 @@ import math
 import random
 from collections import Counter
 from dataclasses import asdict, dataclass
+from itertools import zip_longest
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 
-from corpusgen.graph_records import RenderedRecord
+from corpusgen.graph_records import (
+    RANDOM_CONTROL_POSITION_BINS,
+    RenderedRecord,
+    relative_position_bin,
+)
 from corpusgen.srgm_worlds import (
     WorldConfig,
     generate_eval_pairs,
@@ -25,6 +30,13 @@ from corpusgen.srgm_worlds import (
 
 WRITE_COST_GRID = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 COMPONENT_SHARES = {"bed": 0.45, "graph": 0.30, "reasoning": 0.25}
+POSITION_BIN_COUNT = RANDOM_CONTROL_POSITION_BINS
+_RANDOM_CANDIDATE_POOL_LIMIT = 64
+_EVAL_TASKS = (
+    "path_composition",
+    "date_ordering",
+    "balanced_equality",
+)
 _COMPONENT_ORDER = tuple(COMPONENT_SHARES)
 _ROUTE_WORLD_ID = 1 << 30
 _EVAL_WORLD_ID = 1 << 31
@@ -49,6 +61,22 @@ class EncodedSpan:
     role: str
     fact_id: str | None = None
     fact_cost: FactCost | None = None
+
+
+@dataclass(frozen=True)
+class ExpectedExternalRange:
+    start: int
+    end: int
+    fact_id: str
+
+
+@dataclass(frozen=True)
+class RandomControlCandidate:
+    start: int
+    end: int
+    record_index: int
+    component: str
+    position_bin: int
 
 
 @dataclass(frozen=True)
@@ -117,8 +145,8 @@ class RelationalBuildConfig:
             raise ValueError("data_seed must be non-negative")
         if self.world_size < 16:
             raise ValueError("world_size must be at least 16")
-        if self.eval_pairs_per_task < 0:
-            raise ValueError("eval_pairs_per_task must be non-negative")
+        if self.eval_pairs_per_task <= 0:
+            raise ValueError("eval_pairs_per_task must be positive")
         if self.eval_pairs_per_world <= 0:
             raise ValueError("eval_pairs_per_world must be positive")
         if self.route_stats_pairs_per_task <= 0:
@@ -155,6 +183,22 @@ def _artifact(root: Path, path: Path) -> dict:
         "path": relative.as_posix(),
         "sha256": _sha256_file(path),
         "bytes": path.stat().st_size,
+    }
+
+
+def _histogram_difference(
+    expected: Counter,
+    actual: Counter,
+) -> float:
+    keys = set(expected) | set(actual)
+    mismatch = sum(abs(expected[key] - actual[key]) for key in keys)
+    return mismatch / max(sum(expected.values()), 1)
+
+
+def _position_histogram_json(histogram: Counter) -> dict[str, int]:
+    return {
+        f"{length}:{relative_bin}": count
+        for (length, relative_bin), count in sorted(histogram.items())
     }
 
 
@@ -268,6 +312,64 @@ def derive_weights(
     return weights
 
 
+def position_bin(start: int, end: int, document_length: int) -> int:
+    return relative_position_bin(start, end, document_length)
+
+
+def collect_expected_external_ranges(
+    spans: list[EncodedSpan],
+    policy: RoutePolicy,
+) -> tuple[ExpectedExternalRange, ...]:
+    expected = []
+    for span in spans:
+        if (
+            span.role != "payload"
+            or span.fact_cost is None
+            or not policy.is_external(span.fact_cost)
+        ):
+            continue
+        if span.fact_id is None:
+            raise ValueError("external payload span requires a fact id")
+        expected.append(
+            ExpectedExternalRange(
+                start=span.start,
+                end=span.end,
+                fact_id=span.fact_id,
+            )
+        )
+    return tuple(expected)
+
+
+def validate_split_coverage(
+    expected: tuple[ExpectedExternalRange, ...],
+    spans: list[EncodedSpan],
+    weights: np.ndarray,
+    actual_ranges: list[tuple[int, int, EncodedSpan]],
+) -> None:
+    expected_ranges = [(item.start, item.end) for item in expected]
+    actual = [(start, end) for start, end, _ in actual_ranges]
+    if actual != expected_ranges:
+        raise ValueError(
+            "actual Split ranges do not match expected external payload ranges"
+        )
+    for item in expected:
+        if weights[item.start : item.end].any():
+            raise ValueError(
+                "expected external payload occurrence remained unmasked"
+            )
+    for span in spans:
+        if span.role != "payload" and not weights[
+            span.start : span.end
+        ].all():
+            raise ValueError("protected nonpayload span was Split-masked")
+
+    expected_mask = np.ones(len(weights), dtype=np.uint8)
+    for item in expected:
+        expected_mask[item.start : item.end] = 0
+    if not np.array_equal(weights, expected_mask):
+        raise ValueError("Split contains zeros outside expected external ranges")
+
+
 def _derive_weight_result(
     condition: str,
     spans: list[EncodedSpan],
@@ -300,43 +402,33 @@ def _derive_weight_result(
     available = [
         (span.start, span.end, span)
         for span in spans
-        if span.role == "plain" and span.end > span.start
+        if span.role == "random_control" and span.end > span.start
     ]
     masked = []
     for source in external:
         span_length = source.end - source.start
+        source_bin = position_bin(
+            source.start,
+            source.end,
+            length,
+        )
         candidates = []
-        source_midpoint = (source.start + source.end) / 2
         for index, (start, end, plain_span) in enumerate(available):
-            if end - start < span_length:
+            if end - start != span_length:
                 continue
-            matched_start = round(source_midpoint - span_length / 2)
-            matched_start = min(
-                max(matched_start, start),
-                end - span_length,
-            )
-            midpoint = matched_start + span_length / 2
-            candidates.append(
-                (
-                    abs(midpoint - source_midpoint),
-                    rng.random(),
-                    index,
-                    matched_start,
-                    plain_span,
-                )
-            )
+            if position_bin(start, end, length) != source_bin:
+                continue
+            candidates.append((index, start, plain_span))
         if not candidates:
             raise ValueError(
-                "record lacks a non-factual span matching external payload "
-                f"length {span_length}"
+                "record lacks a random-control span matching external payload "
+                f"key ({span_length}, {source_bin})"
             )
-        _, _, index, start, plain_span = min(candidates)
-        old_start, old_end, _ = available.pop(index)
+        index, start, plain_span = candidates[rng.randrange(len(candidates))]
+        _, old_end, _ = available.pop(index)
         end = start + span_length
-        if old_start < start:
-            available.append((old_start, start, plain_span))
-        if end < old_end:
-            available.append((end, old_end, plain_span))
+        if end != old_end:
+            raise AssertionError("random-control candidates must match exactly")
         weights[start:end] = 0
         masked.append((start, end, plain_span))
     return weights, masked
@@ -353,8 +445,12 @@ class SharedCorpusWriter:
         self.ledger_path = out_dir / "mask-ledger.jsonl"
         self.token_file = self.token_path.open("wb")
         self.weight_files = {
-            condition: path.open("wb")
-            for condition, path in self.weight_paths.items()
+            "dense": self.weight_paths["dense"].open("wb"),
+            "split": self.weight_paths["split"].open("wb"),
+            "random": self.weight_paths["random"].open(
+                "w+b",
+                buffering=0,
+            ),
         }
         self.ledger_file = self.ledger_path.open("w")
         self.total = 0
@@ -367,9 +463,104 @@ class SharedCorpusWriter:
             "split": Counter(),
             "random": Counter(),
         }
+        self.position_histograms = {
+            "split": Counter(),
+            "random": Counter(),
+        }
+        self.expected_position_histogram: Counter[
+            tuple[int, int]
+        ] = Counter()
+        self.expected_length_histogram: Counter[int] = Counter()
+        self.expected_external_ranges = 0
+        self.actual_split_ranges = 0
+        self._expected_range_digest = hashlib.sha256()
+        self._actual_range_digest = hashlib.sha256()
+        self._pending_random: Counter[tuple[int, int]] = Counter()
+        self._candidate_pools: dict[
+            tuple[int, int],
+            list[RandomControlCandidate],
+        ] = {}
+        self._candidate_seen: Counter[tuple[int, int]] = Counter()
         self.protected_roles_unmasked = True
         self.dense_all_ones = True
         self._closed = False
+
+    @staticmethod
+    def _range_bytes(start: int, end: int, fact_id: str) -> bytes:
+        return _json_line(
+            {"start": start, "end": end, "fact_id": fact_id}
+        ).encode()
+
+    def _select_random_candidate(
+        self,
+        candidate: RandomControlCandidate,
+    ) -> None:
+        handle = self.weight_files["random"]
+        return_position = handle.tell()
+        handle.seek(candidate.start)
+        handle.write(bytes(candidate.end - candidate.start))
+        handle.seek(return_position)
+
+        key = (
+            candidate.end - candidate.start,
+            candidate.position_bin,
+        )
+        self.masked_tokens["random"] += key[0]
+        self.span_histograms["random"][key[0]] += 1
+        self.position_histograms["random"][key] += 1
+        self.ledger_file.write(
+            _json_line(
+                {
+                    "component": candidate.component,
+                    "condition": "random",
+                    "record_index": candidate.record_index,
+                    "start": candidate.start,
+                    "end": candidate.end,
+                    "length": key[0],
+                    "position_bin": key[1],
+                    "role": "random_control",
+                }
+            )
+        )
+
+    def _drain_random_pool(
+        self,
+        key: tuple[int, int],
+        rng: random.Random,
+    ) -> None:
+        pool = self._candidate_pools.get(key, [])
+        while self._pending_random[key] and pool:
+            candidate = pool.pop(rng.randrange(len(pool)))
+            self._pending_random[key] -= 1
+            self._select_random_candidate(candidate)
+        if not self._pending_random[key]:
+            del self._pending_random[key]
+        if pool:
+            self._candidate_pools[key] = pool
+        else:
+            self._candidate_pools.pop(key, None)
+
+    def _offer_random_candidate(
+        self,
+        key: tuple[int, int],
+        candidate: RandomControlCandidate,
+        rng: random.Random,
+    ) -> None:
+        self._candidate_seen[key] += 1
+        if self._pending_random[key]:
+            self._pending_random[key] -= 1
+            if not self._pending_random[key]:
+                del self._pending_random[key]
+            self._select_random_candidate(candidate)
+            return
+
+        pool = self._candidate_pools.setdefault(key, [])
+        if len(pool) < _RANDOM_CANDIDATE_POOL_LIMIT:
+            pool.append(candidate)
+            return
+        replacement = rng.randrange(self._candidate_seen[key])
+        if replacement < _RANDOM_CANDIDATE_POOL_LIMIT:
+            pool[replacement] = candidate
 
     def add(
         self,
@@ -381,49 +572,123 @@ class SharedCorpusWriter:
     ) -> None:
         if token_ids.dtype != np.uint16 or token_ids.ndim != 1:
             raise ValueError("token_ids must be a one-dimensional uint16 array")
-        results = {
-            condition: _derive_weight_result(condition, spans, policy, rng)
-            for condition in ("dense", "split", "random")
-        }
-        if any(len(weights) != len(token_ids) for weights, _ in results.values()):
+        expected = collect_expected_external_ranges(spans, policy)
+        dense, _ = _derive_weight_result("dense", spans, policy, rng)
+        split, split_ranges = _derive_weight_result(
+            "split",
+            spans,
+            policy,
+            rng,
+        )
+        validate_split_coverage(expected, spans, split, split_ranges)
+        random_control = np.ones(len(token_ids), dtype=np.uint8)
+        if len(dense) != len(token_ids) or len(split) != len(token_ids):
             raise ValueError("target weights must align with token ids")
 
         record_start = self.total
         self.token_file.write(token_ids.tobytes())
-        for condition in ("dense", "split", "random"):
-            weights, masked = results[condition]
-            self.weight_files[condition].write(weights.tobytes())
-            if condition == "dense":
-                self.dense_all_ones &= bool(weights.all())
-                continue
-            for start, end, span in masked:
-                length = end - start
-                self.masked_tokens[condition] += length
-                self.span_histograms[condition][length] += 1
-                row = {
-                    "component": component,
-                    "condition": condition,
-                    "record_index": self.records,
-                    "start": record_start + start,
-                    "end": record_start + end,
-                    "length": length,
-                    "role": span.role,
-                }
-                if span.fact_id is not None:
-                    row["fact_id"] = span.fact_id
-                self.ledger_file.write(_json_line(row))
+        self.weight_files["dense"].write(dense.tobytes())
+        self.weight_files["split"].write(split.tobytes())
+        self.weight_files["random"].write(random_control.tobytes())
+        self.dense_all_ones &= bool(dense.all())
 
-        split, split_ranges = results["split"]
-        random_control, _ = results["random"]
-        self.external_payload_tokens += sum(
-            end - start for start, end, _ in split_ranges
-        )
+        touched_keys = set()
+        for item in expected:
+            start = record_start + item.start
+            end = record_start + item.end
+            length = item.end - item.start
+            relative_bin = position_bin(
+                item.start,
+                item.end,
+                len(token_ids),
+            )
+            key = (length, relative_bin)
+            touched_keys.add(key)
+            self._pending_random[key] += 1
+            self.expected_external_ranges += 1
+            self.external_payload_tokens += length
+            self.expected_length_histogram[length] += 1
+            self.expected_position_histogram[key] += 1
+            digest_value = self._range_bytes(start, end, item.fact_id)
+            self._expected_range_digest.update(digest_value)
+            self.ledger_file.write(
+                _json_line(
+                    {
+                        "component": component,
+                        "condition": "expected_split",
+                        "record_index": self.records,
+                        "start": start,
+                        "end": end,
+                        "length": length,
+                        "position_bin": relative_bin,
+                        "role": "payload",
+                        "fact_id": item.fact_id,
+                    }
+                )
+            )
+        for key in sorted(touched_keys):
+            self._drain_random_pool(key, rng)
+
+        for start, end, span in split_ranges:
+            length = end - start
+            relative_bin = position_bin(start, end, len(token_ids))
+            global_start = record_start + start
+            global_end = record_start + end
+            self.actual_split_ranges += 1
+            self.masked_tokens["split"] += length
+            self.span_histograms["split"][length] += 1
+            self.position_histograms["split"][
+                (length, relative_bin)
+            ] += 1
+            if span.fact_id is None:
+                raise ValueError("Split payload range requires a fact id")
+            self._actual_range_digest.update(
+                self._range_bytes(
+                    global_start,
+                    global_end,
+                    span.fact_id,
+                )
+            )
+            self.ledger_file.write(
+                _json_line(
+                    {
+                        "component": component,
+                        "condition": "split",
+                        "record_index": self.records,
+                        "start": global_start,
+                        "end": global_end,
+                        "length": length,
+                        "position_bin": relative_bin,
+                        "role": span.role,
+                        "fact_id": span.fact_id,
+                    }
+                )
+            )
+
+        for span in spans:
+            if span.role != "random_control":
+                continue
+            length = span.end - span.start
+            relative_bin = position_bin(
+                span.start,
+                span.end,
+                len(token_ids),
+            )
+            key = (length, relative_bin)
+            self._offer_random_candidate(
+                key,
+                RandomControlCandidate(
+                    start=record_start + span.start,
+                    end=record_start + span.end,
+                    record_index=self.records,
+                    component=component,
+                    position_bin=relative_bin,
+                ),
+                rng,
+            )
+
         for span in spans:
             if span.role != "payload" and not split[span.start : span.end].all():
-                self.protected_roles_unmasked = False
-            if span.role != "plain" and not random_control[
-                span.start : span.end
-            ].all():
                 self.protected_roles_unmasked = False
 
         self.total += len(token_ids)
@@ -556,6 +821,172 @@ def _write_eval_sets(cfg: RelationalBuildConfig, eval_dir: Path) -> dict:
     }
 
 
+def validate_eval_sets(
+    cfg: RelationalBuildConfig,
+    training_graph_path: Path,
+    eval_graph_path: Path,
+    original_path: Path,
+    counterfactual_path: Path,
+) -> dict[str, bool]:
+    task_counts = {
+        "original": Counter(),
+        "counterfactual": Counter(),
+    }
+    seen_pair_ids = set()
+    changed_rows: dict[tuple[int, str, str], set[str]] = {}
+
+    with (
+        original_path.open() as original_file,
+        counterfactual_path.open() as counterfactual_file,
+    ):
+        original_lines = (line for line in original_file if line.strip())
+        counterfactual_lines = (
+            line for line in counterfactual_file if line.strip()
+        )
+        for line_number, (original_line, counterfactual_line) in enumerate(
+            zip_longest(original_lines, counterfactual_lines),
+            1,
+        ):
+            if original_line is None or counterfactual_line is None:
+                raise ValueError("every eval pair requires exactly two variants")
+            original = json.loads(original_line)
+            counterfactual = json.loads(counterfactual_line)
+            original_meta = original["meta"]
+            counterfactual_meta = counterfactual["meta"]
+            pair_id = original_meta["pair_id"]
+            if (
+                pair_id != counterfactual_meta["pair_id"]
+                or pair_id in seen_pair_ids
+                or original_meta["variant"] != "original"
+                or counterfactual_meta["variant"] != "counterfactual"
+            ):
+                raise ValueError(
+                    f"eval line {line_number} does not contain two variants"
+                )
+            seen_pair_ids.add(pair_id)
+
+            if original["task"] != counterfactual["task"]:
+                raise ValueError("eval twins must have the same task")
+            task = original["task"]
+            if task not in _EVAL_TASKS:
+                raise ValueError(f"unexpected eval task: {task}")
+            task_counts["original"][task] += 1
+            task_counts["counterfactual"][task] += 1
+
+            if original["answer"] == counterfactual["answer"]:
+                raise ValueError("original and counterfactual answers must flip")
+            if original_meta.get("changed_row") is not None:
+                raise ValueError("original eval item must not contain a changed row")
+            changed_row = counterfactual_meta.get("changed_row")
+            if not isinstance(changed_row, dict):
+                raise ValueError("counterfactual requires a changed supporting row")
+
+            original_gold = {
+                (int(source), str(relation), str(direction))
+                for source, relation, direction in original_meta[
+                    "gold_addresses"
+                ]
+            }
+            counterfactual_gold = {
+                (int(source), str(relation), str(direction))
+                for source, relation, direction in counterfactual_meta[
+                    "gold_addresses"
+                ]
+            }
+            changed_address = (
+                int(changed_row["source_id"]),
+                str(changed_row["relation_id"]),
+                str(changed_row["direction"]),
+            )
+            if (
+                original_gold != counterfactual_gold
+                or changed_address not in original_gold
+            ):
+                raise ValueError(
+                    "changed row must be one of the pair's supporting rows"
+                )
+            changed_rows.setdefault(changed_address, set()).add(
+                _canonical_json(changed_row)
+            )
+
+    expected_counts = {
+        task: cfg.eval_pairs_per_task for task in _EVAL_TASKS
+    }
+    if (
+        dict(task_counts["original"]) != expected_counts
+        or dict(task_counts["counterfactual"]) != expected_counts
+        or len(seen_pair_ids) != cfg.eval_pairs_per_task * len(_EVAL_TASKS)
+    ):
+        raise ValueError("eval task counts do not match the frozen contract")
+
+    def source_bounds(path: Path) -> tuple[int, int]:
+        minimum = None
+        maximum = None
+        with path.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                source_id = int(json.loads(line)["source_id"])
+                minimum = source_id if minimum is None else min(minimum, source_id)
+                maximum = source_id if maximum is None else max(maximum, source_id)
+        if minimum is None or maximum is None:
+            raise ValueError(f"graph is empty: {path.name}")
+        return minimum, maximum
+
+    found_changed_addresses = set()
+    eval_minimum = None
+    eval_maximum = None
+    with eval_graph_path.open() as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            source_id = int(row["source_id"])
+            eval_minimum = (
+                source_id
+                if eval_minimum is None
+                else min(eval_minimum, source_id)
+            )
+            eval_maximum = (
+                source_id
+                if eval_maximum is None
+                else max(eval_maximum, source_id)
+            )
+            address = (
+                source_id,
+                str(row["relation_id"]),
+                str(row["direction"]),
+            )
+            if address not in changed_rows:
+                continue
+            found_changed_addresses.add(address)
+            base_row = _canonical_json(row)
+            if base_row in changed_rows[address]:
+                raise ValueError(
+                    "counterfactual changed row equals its base supporting row"
+                )
+    if eval_minimum is None or eval_maximum is None:
+        raise ValueError("eval graph is empty")
+    if found_changed_addresses != set(changed_rows):
+        raise ValueError("changed supporting row is absent from the eval graph")
+
+    train_minimum, train_maximum = source_bounds(training_graph_path)
+    if not (
+        train_maximum < eval_minimum or eval_maximum < train_minimum
+    ):
+        raise ValueError(
+            "fresh eval graph source ids overlap training source ids"
+        )
+
+    return {
+        "exact_task_counts": True,
+        "two_variants_per_pair": True,
+        "answer_flips": True,
+        "changed_supporting_row": True,
+        "fresh_sources_disjoint": True,
+    }
+
+
 def build_relational_corpus(
     cfg: RelationalBuildConfig,
     tok,
@@ -601,6 +1032,14 @@ def build_relational_corpus(
     _write_json(graph_manifest_path, graph_manifest)
 
     eval_report = _write_eval_sets(cfg, eval_dir)
+    eval_checks = validate_eval_sets(
+        cfg,
+        graph_path,
+        eval_dir / "graph.jsonl",
+        eval_dir / "original.jsonl",
+        eval_dir / "counterfactual.jsonl",
+    )
+    eval_report["checks"] = eval_checks
     eval_manifest_path = out_dir / "eval-manifest.json"
     _write_json(
         eval_manifest_path,
@@ -774,6 +1213,27 @@ def build_relational_corpus(
                 }
                 for condition, histogram in writer.span_histograms.items()
             },
+            "position_histograms": {
+                "expected": _position_histogram_json(
+                    writer.expected_position_histogram
+                ),
+                "split": _position_histogram_json(
+                    writer.position_histograms["split"]
+                ),
+                "random": _position_histogram_json(
+                    writer.position_histograms["random"]
+                ),
+            },
+            "external_payload_ranges": {
+                "expected_count": writer.expected_external_ranges,
+                "actual_split_count": writer.actual_split_ranges,
+                "expected_sha256": (
+                    writer._expected_range_digest.hexdigest()
+                ),
+                "actual_split_sha256": (
+                    writer._actual_range_digest.hexdigest()
+                ),
+            },
         },
     )
 
@@ -799,6 +1259,10 @@ def build_relational_corpus(
     split_mass = writer.masked_tokens["split"]
     random_mass = writer.masked_tokens["random"]
     mass_denominator = max(split_mass, 1)
+    range_digests_match = (
+        writer._expected_range_digest.hexdigest()
+        == writer._actual_range_digest.hexdigest()
+    )
     file_token_count = writer.token_path.stat().st_size // np.dtype(
         np.uint16
     ).itemsize
@@ -811,16 +1275,35 @@ def build_relational_corpus(
             writer.external_payload_tokens == split_mass
             and split_mass > 0
         ),
+        "external_payload_ranges_exact": (
+            writer.expected_external_ranges == writer.actual_split_ranges
+            and range_digests_match
+            and writer.expected_length_histogram
+            == writer.span_histograms["split"]
+            and writer.expected_position_histogram
+            == writer.position_histograms["split"]
+        ),
         "random_mass_within_1pct": (
             abs(random_mass - split_mass) / mass_denominator <= 0.01
         ),
         "random_span_histogram_within_1pct": (
-            writer.span_histograms["random"]
-            == writer.span_histograms["split"]
+            _histogram_difference(
+                writer.span_histograms["split"],
+                writer.span_histograms["random"],
+            )
+            <= 0.01
+        ),
+        "random_position_histogram_within_1pct": (
+            _histogram_difference(
+                writer.position_histograms["split"],
+                writer.position_histograms["random"],
+            )
+            <= 0.01
         ),
         "mixture_within_1pct": mixture_deviation <= 0.01,
         "graph_mixture_exact": graph_mixture_exact,
         "protected_roles_unmasked": writer.protected_roles_unmasked,
+        "eval_validity": all(eval_checks.values()),
         "schedule_hash_stable": (
             schedule_digest.hexdigest() == schedule_sha256
         ),
@@ -861,6 +1344,14 @@ def build_relational_corpus(
         },
         "masks": {
             "external_payload_tokens": writer.external_payload_tokens,
+            "expected_external_ranges": writer.expected_external_ranges,
+            "actual_split_ranges": writer.actual_split_ranges,
+            "expected_range_sha256": (
+                writer._expected_range_digest.hexdigest()
+            ),
+            "actual_split_range_sha256": (
+                writer._actual_range_digest.hexdigest()
+            ),
             "split_masked_tokens": split_mass,
             "random_masked_tokens": random_mass,
             "split_span_histogram": {
@@ -873,6 +1364,21 @@ def build_relational_corpus(
                 str(length): count
                 for length, count in sorted(
                     writer.span_histograms["random"].items()
+                )
+            },
+            "expected_position_histogram": _position_histogram_json(
+                writer.expected_position_histogram
+            ),
+            "split_position_histogram": _position_histogram_json(
+                writer.position_histograms["split"]
+            ),
+            "random_position_histogram": _position_histogram_json(
+                writer.position_histograms["random"]
+            ),
+            "unmatched_random_keys": {
+                f"{length}:{relative_bin}": count
+                for (length, relative_bin), count in sorted(
+                    writer._pending_random.items()
                 )
             },
         },
