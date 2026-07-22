@@ -1,0 +1,19 @@
+{
+  "calibration": {
+    "data_seeds": [
+      10000,
+      10001,
+      10002
+    ],
+    "require_route_rate_max": 0.6,
+    "require_route_rate_min": 0.4,
+    "source": "disjoint deterministic development worlds"
+  },
+  "policy": {
+    "hop_cost": 0.25,
+    "read_cost": 0.25,
+    "write_cost": 1.0
+  },
+  "policy_sha256": "0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058",
+  "schema_version": 1
+}

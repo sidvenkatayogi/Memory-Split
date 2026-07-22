@@ -1,0 +1,6 @@
+configs/360m/d360m_dense_n1p8m_s0.yaml
+configs/360m/d360m_dense_n1p8m_s1.yaml
+configs/360m/d360m_dense_n1p8m_s2.yaml
+configs/360m/d360m_split_n1p8m_s0.yaml
+configs/360m/d360m_split_n1p8m_s1.yaml
+configs/360m/d360m_split_n1p8m_s2.yaml

@@ -1,0 +1,15 @@
+configs/160m/d160m_dense_n50k_s0.yaml
+configs/160m/d160m_dense_n50k_s1.yaml
+configs/160m/d160m_dense_n50k_s2.yaml
+configs/160m/d160m_split_n50k_s0.yaml
+configs/160m/d160m_split_n50k_s1.yaml
+configs/160m/d160m_split_n50k_s2.yaml
+configs/160m/d160m_dense_n800k_s0.yaml
+configs/160m/d160m_dense_n800k_s1.yaml
+configs/160m/d160m_dense_n800k_s2.yaml
+configs/160m/d160m_split_n800k_s0.yaml
+configs/160m/d160m_split_n800k_s1.yaml
+configs/160m/d160m_split_n800k_s2.yaml
+configs/160m/d160m_random_n800k_s0.yaml
+configs/160m/d160m_random_n800k_s1.yaml
+configs/160m/d160m_random_n800k_s2.yaml

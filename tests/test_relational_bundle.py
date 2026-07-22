@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import scripts.package_relational_run as package_module
+from scripts.make_relational_manifest import write_manifests
 from scripts.package_relational_run import main, package_run
 
 
@@ -126,6 +128,50 @@ def test_bundle_is_deterministic_relative_and_hash_complete(tmp_path):
         assert member.pax_headers["SHA256"] == hashlib.sha256(
             files[member.name]
         ).hexdigest()
+
+
+def test_bundle_integrates_production_manifests_and_real_smoke_report(tmp_path):
+    assert hasattr(package_module, "production_inputs")
+    input_root = tmp_path / "inputs"
+    generated = write_manifests(input_root)
+    (input_root / "route-policy.json").write_text(
+        '{"policy":{"hop_cost":0.25,"read_cost":0.25,"write_cost":1.0},'
+        '"policy_sha256":'
+        '"0214cd5dd63e7534dc786569f8b789b6c614ffbe219c84887bd3a71b57bcf058"}\n'
+    )
+    smoke_report = {
+        "shared_stream": True,
+        "dense_steps": 2,
+        "split_steps": 2,
+        "resume_exact": True,
+        "memory_modes": ["off", "on"],
+        "pairs_complete": True,
+    }
+    (input_root / "smoke-report.json").write_text(
+        json.dumps(smoke_report, sort_keys=True) + "\n"
+    )
+    production = package_module.production_inputs(input_root)
+
+    archive = package_run(
+        tmp_path / "production.tar.gz",
+        source_root=REPO_ROOT,
+        input_root=input_root,
+        config_inputs=production["configs"],
+        manifest_inputs=production["manifests"],
+        route_policy="route-policy.json",
+        smoke_report="smoke-report.json",
+    )
+    _, files = _archive_files(archive)
+
+    assert json.loads(
+        files["fixtures/relational-smoke-report.json"]
+    ) == smoke_report
+    for scale, result in generated.items():
+        manifest = result["manifest"].relative_to(input_root).as_posix()
+        assert files[manifest] == result["manifest"].read_bytes()
+        for config in result["configs"]:
+            relative = config.relative_to(input_root).as_posix()
+            assert files[relative] == config.read_bytes()
 
 
 @pytest.mark.parametrize(

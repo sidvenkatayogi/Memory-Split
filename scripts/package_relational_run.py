@@ -40,12 +40,29 @@ _TASK5_SOURCE = {
     "tests/test_relational_bundle.py",
     "tests/test_relational_smoke.py",
 }
+_TASK6_SOURCE = {
+    "cluster/RELATIONAL-RUNBOOK.md",
+    "cluster/aws/run_relational_manifest.py",
+    "cluster/slurm/relational_train.sbatch",
+    "scripts/make_relational_manifest.py",
+    "scripts/platform_preflight.py",
+    "tests/test_platform_preflight.py",
+    "tests/test_relational_manifest.py",
+}
 _SMOKE_BUNDLE_FIXTURE = {
     "data_seed": SMOKE_FIXTURE["data_seed"],
     "eval_pairs_per_task": SMOKE_FIXTURE["eval_pairs_per_task"],
     "n_entities": SMOKE_FIXTURE["n_entities"],
     "steps": SMOKE_STEPS,
     "total_tokens": SMOKE_FIXTURE["total_tokens"],
+}
+_SMOKE_REPORT_KEYS = {
+    "shared_stream",
+    "dense_steps",
+    "split_steps",
+    "resume_exact",
+    "memory_modes",
+    "pairs_complete",
 }
 
 
@@ -180,6 +197,52 @@ def _validate_input_content(data: bytes, *, label: str, kind: str) -> None:
         _validate_portable_string(value, label=label)
 
 
+def _validate_smoke_report(data: bytes) -> None:
+    try:
+        report = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("smoke report must contain valid JSON") from error
+    if not isinstance(report, dict) or set(report) != _SMOKE_REPORT_KEYS:
+        raise ValueError("smoke report does not match the Task 5 contract")
+    if not (
+        report["shared_stream"] is True
+        and report["dense_steps"] == SMOKE_STEPS
+        and report["split_steps"] == SMOKE_STEPS
+        and report["resume_exact"] is True
+        and report["memory_modes"] == ["off", "on"]
+        and report["pairs_complete"] is True
+    ):
+        raise ValueError("smoke report is not entirely green")
+
+
+def production_inputs(input_root: Path | str = ".") -> dict:
+    """Load the exact checked-in Task 6 manifests for Task 5 packaging."""
+
+    root = Path(input_root)
+    configs = {}
+    manifests = {}
+    for scale, expected_count in EXPECTED_RUN_COUNTS.items():
+        manifest = f"configs/{scale}.tsv"
+        manifest_path = root / manifest
+        if not manifest_path.is_file():
+            raise FileNotFoundError(manifest_path)
+        rows = [
+            _portable_relative(line.strip(), label=f"{scale} config")
+            for line in manifest_path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if len(rows) != expected_count or len(set(rows)) != expected_count:
+            raise ValueError(
+                f"{scale} requires exactly {expected_count} unique configs"
+            )
+        for row in rows:
+            if not (root / row).is_file():
+                raise FileNotFoundError(root / row)
+        configs[scale] = rows
+        manifests[scale] = manifest
+    return {"configs": configs, "manifests": manifests}
+
+
 def _tracked_source_paths(source_root: Path) -> list[str]:
     tracked = {
         line
@@ -187,10 +250,12 @@ def _tracked_source_paths(source_root: Path) -> list[str]:
         .splitlines()
         if line
     }
+    required_task_source = _TASK5_SOURCE | _TASK6_SOURCE
     selected = {
         path
-        for path in tracked | _TASK5_SOURCE
-        if path == "requirements.txt"
+        for path in tracked | required_task_source
+        if path in required_task_source
+        or path == "requirements.txt"
         or path.endswith(".py")
         and path.startswith(_SOURCE_PREFIXES)
     }
@@ -262,6 +327,7 @@ def package_run(
     config_inputs: Mapping[str, Sequence[str | Path]],
     manifest_inputs: Mapping[str, str | Path],
     route_policy: str | Path,
+    smoke_report: str | Path | None = None,
     source_root: Path | str | None = None,
     input_root: Path | str | None = None,
     require_clean: bool = False,
@@ -291,6 +357,21 @@ def package_run(
             json.dumps(_SMOKE_BUNDLE_FIXTURE, indent=2, sort_keys=True) + "\n"
         ).encode(),
     )
+    if smoke_report is not None:
+        smoke_path = _portable_relative(smoke_report, label="smoke report")
+        _require_suffix(smoke_path, (".json",), label="smoke report")
+        smoke_data = _read_input(inputs, smoke_path, label="smoke report")
+        _validate_input_content(
+            smoke_data,
+            label="smoke report",
+            kind="json",
+        )
+        _validate_smoke_report(smoke_data)
+        _add_payload(
+            payload,
+            "fixtures/relational-smoke-report.json",
+            smoke_data,
+        )
 
     policy_path = _portable_relative(route_policy, label="route policy")
     _require_suffix(policy_path, (".json",), label="route policy")
@@ -380,24 +461,53 @@ def main(argv: list[str] | None = None) -> int:
         default=str(Path(__file__).resolve().parents[1]),
     )
     parser.add_argument("--input-root")
-    parser.add_argument("--route-policy", required=True)
-    parser.add_argument("--manifest-160m", required=True)
-    parser.add_argument("--manifest-360m", required=True)
-    parser.add_argument("--config-160m", action="append", required=True)
-    parser.add_argument("--config-360m", action="append", required=True)
+    parser.add_argument(
+        "--route-policy",
+        default="configs/route-policy.json",
+    )
+    parser.add_argument(
+        "--smoke-report",
+        default="outputs/relational-smoke/smoke-report.json",
+    )
+    parser.add_argument("--manifest-160m")
+    parser.add_argument("--manifest-360m")
+    parser.add_argument("--config-160m", action="append")
+    parser.add_argument("--config-360m", action="append")
     args = parser.parse_args(argv)
+    input_root = Path(args.input_root) if args.input_root else Path(args.source_root)
+    production = production_inputs(input_root)
+    explicit_configs = args.config_160m is not None or args.config_360m is not None
+    if explicit_configs and (
+        args.config_160m is None or args.config_360m is None
+    ):
+        parser.error("explicit configs require both 160m and 360m inputs")
     archive = package_run(
         args.out,
         source_root=args.source_root,
-        input_root=args.input_root,
+        input_root=input_root,
         route_policy=args.route_policy,
+        smoke_report=args.smoke_report,
         config_inputs={
-            "160m": args.config_160m,
-            "360m": args.config_360m,
+            "160m": (
+                args.config_160m
+                if explicit_configs
+                else production["configs"]["160m"]
+            ),
+            "360m": (
+                args.config_360m
+                if explicit_configs
+                else production["configs"]["360m"]
+            ),
         },
         manifest_inputs={
-            "160m": args.manifest_160m,
-            "360m": args.manifest_360m,
+            "160m": (
+                args.manifest_160m
+                or production["manifests"]["160m"]
+            ),
+            "360m": (
+                args.manifest_360m
+                or production["manifests"]["360m"]
+            ),
         },
         require_clean=True,
     )
