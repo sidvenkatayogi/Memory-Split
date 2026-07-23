@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.env
 .tiktoken_cache/
 .venv/
 .pytest_cache/

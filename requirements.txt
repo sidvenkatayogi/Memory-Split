@@ -10,3 +10,6 @@ datasets>=2.19
 huggingface_hub>=0.23
 # Tests
 pytest>=8.0
+# PoC: optimal (GPT-5.6-sol) retriever via the TrueFoundry OpenAI-compatible gateway
+openai>=1.30
+python-dotenv>=1.0
