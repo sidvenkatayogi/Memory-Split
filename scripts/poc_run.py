@@ -54,35 +54,55 @@ GOLDEN_PATH = PERSIST_DIR / "golden_knowledge.jsonl"
 RESULTS_PATH = PERSIST_DIR / "poc_results.json"
 FIGURE_PATH = PERSIST_DIR / "poc_figure.png"
 
-# Colab-sized twin (matched across arms; only the loss mask differs). ctx 512
-# leaves headroom so iGSM/deduction eval prompts aren't left-truncated.
-MODEL = {"n_layer": 4, "n_head": 4, "d_model": 256, "ctx": 512, "vocab_size": 50304}
-MICRO_BS = 8
-TOKENS_PER_STEP = 4096  # accum = 1 at ctx 512
-LR = 1.5e-3
-WARMUP = 40
-TRAIN_SEED = 7          # SAME for both arms -> identical initialization
-EVAL_MAX_NEW = 64       # realfact traces are short
+# Model presets matched to what the team runs (train/model.py PRESETS /
+# scripts/make_relational_manifest.py SCALE_SETTINGS): d160m and d360m are the
+# two "protected" science scales; toy is the cheap pilot. micro_batch_size / lr
+# mirror the team's per-scale settings; ctx is kept at 512 (realfact traces are
+# short, and it fits a single Colab GPU) and the global batch is grad-accumulated
+# to TOKENS_PER_STEP. Only the loss mask differs between the two arms.
+POC_PRESETS = {
+    "toy":   {"dims": {"n_layer": 4,  "n_head": 4,  "d_model": 256},  "micro_bs": 8, "lr": 1.5e-3},
+    "d160m": {"dims": {"n_layer": 12, "n_head": 12, "d_model": 768},  "micro_bs": 8, "lr": 1.5e-3},
+    "d360m": {"dims": {"n_layer": 20, "n_head": 16, "d_model": 1024}, "micro_bs": 4, "lr": 1.0e-3},
+}
+CTX = 512
+TOKENS_PER_STEP = 16384  # global batch via grad accumulation
+WARMUP = 300             # matches the team's warmup_steps
+TRAIN_SEED = 7           # SAME for both arms -> identical initialization
+EVAL_MAX_NEW = 64        # realfact traces are short
 REASON_MAX_NEW = 160
 ARMS = ("dense", "split")
 
 
-def _trainer_cfg(arm: str, steps: int, device: str, ckpt_minutes: float = 10) -> dict:
+def _model_dict(model_name: str) -> dict:
+    dims = POC_PRESETS[model_name]["dims"]
+    return {**dims, "ctx": CTX, "vocab_size": 50304}
+
+
+def _run_dir(model_name: str, arm: str) -> Path:
+    # Keyed by scale so different --model runs don't collide (and a resume never
+    # loads a checkpoint of the wrong shape).
+    return RUNS_DIR / model_name / arm
+
+
+def _trainer_cfg(arm: str, steps: int, device: str, model_name: str,
+                 ckpt_minutes: float = 10) -> dict:
+    preset = POC_PRESETS[model_name]
     return {
-        "run_id": f"poc_{arm}",
+        "run_id": f"poc_{model_name}_{arm}",
         "arm": arm,
-        "model": MODEL,
+        "model": _model_dict(model_name),
         "train_bin": str(CORPUS_DIR / arm / "train.bin"),
         # dense: no mask -> loss everywhere; split: fact values masked.
         "train_mask": str(CORPUS_DIR / arm / "train.mask.bin") if arm == "split" else None,
-        "micro_batch_size": MICRO_BS,
+        "micro_batch_size": preset["micro_bs"],
         "tokens_per_step": TOKENS_PER_STEP,
         "max_steps": steps,
-        "lr": LR,
+        "lr": preset["lr"],
         "warmup_steps": WARMUP,
         "seed": TRAIN_SEED,
         "device": device,
-        "out_dir": str(RUNS_DIR / arm),
+        "out_dir": str(_run_dir(model_name, arm)),
         "log_every": 25,
         "eval_every": 200,
         "snap_frac": 0.5,
@@ -143,15 +163,18 @@ def stage_build(args) -> dict:
 
 def stage_train(args, arms=ARMS) -> None:
     device = pick_device(args.device)
-    print(f"[train] checkpoints -> {RUNS_DIR} "
+    print(f"[train] model={args.model} checkpoints -> {RUNS_DIR / args.model} "
           f"({'PERSISTED (Drive)' if os.environ.get('POC_PERSIST_DIR') else 'LOCAL/ephemeral'})")
     for arm in arms:
-        out_dir = RUNS_DIR / arm
-        cfg = _trainer_cfg(arm, args.steps, device, ckpt_minutes=args.ckpt_minutes)
+        cfg = _trainer_cfg(arm, args.steps, device, args.model,
+                           ckpt_minutes=args.ckpt_minutes)
         trainer = Trainer(cfg)
+        n_params = sum(p.numel() for p in trainer.model.parameters())
         if trainer.ckpt_path.exists() and not args.fresh:
             trainer.load_ckpt()
             print(f"[train] {arm}: resumed at step {trainer.step}")
+        print(f"[train] {arm}: {n_params/1e6:.1f}M params, "
+              f"micro_bs={cfg['micro_batch_size']} tokens/step={cfg['tokens_per_step']}")
         final = trainer.train_steps()
         print(f"[train] {arm}: done at step {trainer.step} (loss_ema={final:.4f})")
 
@@ -199,8 +222,8 @@ def stage_eval(args) -> dict:
         )
     golden = load_golden_knowledge(GOLDEN_PATH)
 
-    dense = _load_model(RUNS_DIR / "dense", device)
-    split = _load_model(RUNS_DIR / "split", device)
+    dense = _load_model(_run_dir(args.model, "dense"), device)
+    split = _load_model(_run_dir(args.model, "split"), device)
 
     # Headline fact-QA: SPLIT @ GPT-oracle vs DENSE @ closed-book.
     split_oracle = score_items_oracle(split, tok, items, golden, device, max_new=EVAL_MAX_NEW)
@@ -341,6 +364,9 @@ def main() -> None:
     ap.add_argument("--stage", default="all",
                     choices=["all", "build", "train", "gen-golden", "eval", "report"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    ap.add_argument("--model", default="d160m", choices=list(POC_PRESETS),
+                    help="model scale (matches the team: d160m/d360m; toy = pilot). "
+                         "d360m needs an A100-class GPU")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--ckpt-minutes", type=float, default=10,
                     help="wall-clock checkpoint cadence (lower = less lost on a "

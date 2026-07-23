@@ -16,6 +16,12 @@ one corpus, the same model, the same token/step budget, and the same
 initialization — **the only difference is whether fact values carry training
 loss** (DENSE) or are masked out (SPLIT, LMLM-style).
 
+**Scale.** Defaults to the team's primary science scale **`d160m` (~162M
+params)**; `--model d360m` (~356M) matches the stretch scale (needs an A100),
+`--model toy` (~29M) is the cheap pilot. Architecture and per-scale
+`micro_batch_size` / `lr` mirror `train/model.py` PRESETS and
+`scripts/make_relational_manifest.py`.
+
 ## How it works
 
 - **Corpus** (`corpusgen/poc_build.py`): real PopQA facts as `Question /
@@ -79,7 +85,8 @@ Offline wiring tests (no network, no creds):
 
 ## Knobs (`scripts/poc_run.py`)
 
-`--steps` (train steps), `--max-facts` (cap PopQA facts), `--exposures`,
+`--model {toy,d160m,d360m}` (scale; default d160m), `--steps` (train steps),
+`--max-facts` (cap PopQA facts), `--exposures`,
 `--igsm-docs/--deduction-docs/--bed-docs`, `--heldout/--seen` (fact-QA eval
 sizes; default 25 + 25 = 50), `--gold-oracle` (also report the exact upper
 bound with PopQA gold injected), `--ground-truth-fallback` (inject gold when
@@ -94,9 +101,9 @@ GPT disagrees, making the oracle exactly optimal), `--gpt-model`.
   facts; SPLIT should be ≥ DENSE (retrieval is lossless; parametric recall loses
   the long tail).
 - **Reasoning composite (iGSM + deduction):** the direct capacity-crowding
-  signal, but **likely underpowered/near-chance at this toy Colab scale** (the
-  design notes reasoning stays near chance for tiny models). Reported as
-  supporting-but-inconclusive.
+  signal. Even at d160m this runs on **far fewer tokens than the team's cluster
+  runs** (a single Colab GPU overnight, not billions of tokens), so treat it as
+  indicative/supporting, not a final measurement.
 - **GPT fidelity:** how optimal GPT-5.6-sol actually was vs the PopQA gold.
 
 This measures the **upper bound** of the split approach (perfect retrieval); the
