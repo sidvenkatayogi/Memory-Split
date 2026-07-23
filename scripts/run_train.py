@@ -5,8 +5,13 @@ Usage: python scripts/train.py --config configs/foo.yaml [--resume auto|none]
 """
 
 import argparse
+import sys
+from pathlib import Path
 
 import yaml
+
+# Run from anywhere without PYTHONPATH (e.g. Colab): repo root on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def main() -> None:
