@@ -34,11 +34,16 @@ params)**; `--model d360m` (~356M) matches the stretch scale (needs an A100),
   for *any* emitted key (removing the address-construction confound). The
   existing decoder `evals/generate.py` injects the value as the answer text — no
   core change.
-- **Eval** (`evals/oracle_scorer.py`): three fact-QA conditions —
-  **DENSE @ closed-book** (parametric recall), **DENSE + oracle (RAG)** (the
-  golden fact given in-context), and **SPLIT @ GPT-oracle** (split asks; golden
-  value injected). All scored by `evals/keyguess.py` (alias-tolerant answer
-  match on the model's *generation*), grouped **seen vs held-out**.
+- **Fact-QA eval** (`evals/oracle_scorer.py`, single-hop): **DENSE @ closed-book**
+  (parametric recall), **DENSE + oracle (RAG)** (golden fact in-context),
+  **SPLIT @ GPT-oracle** (split asks; golden value injected), + a
+  **SPLIT @ gold** upper bound. Scored on the model's *generation*, grouped
+  **seen vs held-out**, with both string-match and an optional **LLM judge**
+  (`--judge`, `evals/gpt_oracle.judge_answer`) that credits paraphrases/aliases.
+- **Reason-over-facts eval** (`evals/reasoning.py`): GPT-phrased compositional
+  yes/no questions over pairs of real facts (answer = derived, not any single
+  fact). Both arms answer **in-context** (facts in the prompt) — reuses the
+  trained checkpoints, tests reasoning capacity given identical facts.
 - **Orchestration** (`scripts/poc_run.py`): `build → train → gen-golden → eval →
   report`.
 
@@ -87,7 +92,9 @@ Offline wiring tests (no network, no creds):
 
 ## Knobs (`scripts/poc_run.py`)
 
+`--stage {build,train,gen-golden,eval,reason,report,all}`,
 `--model {toy,d160m,d360m}` (scale; default d160m), `--steps` (train steps),
+`--judge` (LLM-graded fact-QA), `--n-reason` (reason-over-facts items),
 `--max-facts` (cap PopQA facts), `--exposures`,
 `--igsm-docs/--deduction-docs/--bed-docs`, `--heldout/--seen` (fact-QA eval
 sizes; default 25 + 25 = 50), `--gold-oracle` (also report the exact upper
@@ -110,7 +117,17 @@ GPT disagrees, making the oracle exactly optimal), `--gpt-model`.
   signal. Even at d160m this runs on **far fewer tokens than the team's cluster
   runs** (a single Colab GPU overnight, not billions of tokens), so treat it as
   indicative/supporting, not a final measurement.
-- **GPT fidelity:** how optimal GPT-5.6-sol actually was vs the PopQA gold.
+- **GPT fidelity:** how optimal GPT-5.6-sol actually was vs the PopQA gold —
+  reported both string-match and (with `--judge`) LLM-graded; the judge number
+  is the fair one, since PopQA long-tail answers have many valid phrasings.
+- **Reason-over-facts:** dense vs split on compositional yes/no questions, with
+  the majority-class baseline shown. This is the arm that actually needs
+  *combining* facts (fact ≠ answer); single-hop fact-QA does not.
+
+Note on single-hop fact-QA: because the retrieved fact **is** the answer, the
+`SPLIT @ gold` arm is essentially a copy sanity-check (100%), and the fact-QA
+arms measure *fact access* (retrieval vs parametric recall), not reasoning. Use
+the reason-over-facts and knowledge-free arms for the reasoning question.
 
 This measures the **upper bound** of the split approach (perfect retrieval); the
 real retriever the team is building will land below it.

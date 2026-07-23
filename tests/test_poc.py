@@ -122,6 +122,41 @@ def test_generate_golden_knowledge_with_mock(tmp_path):
     assert load_golden_knowledge(cache) == gs2.by_qid
 
 
+def test_reasoning_items_and_grade():
+    from corpusgen.realfact import load_realfacts
+    from evals import reasoning
+
+    facts = load_realfacts(REALFACTS)
+    items = reasoning.generate_reasoning_items(facts, n=12, seed=0, client=None)
+    assert 0 < len(items) <= 12
+    for it in items:
+        assert it["answer"] in ("yes", "no")
+        assert len(it["facts"]) == 2
+        same = it["facts"][0][2] == it["facts"][1][2]   # objA == objB
+        assert (it["answer"] == "yes") == same          # gold matches the facts
+        assert "Facts:" in reasoning.reasoning_prompt(it)
+        assert it["question"] in reasoning.reasoning_prompt(it)
+    assert reasoning.grade_yesno("I think the answer is yes.", "yes")
+    assert reasoning.grade_yesno("No, they differ.", "no")
+    assert not reasoning.grade_yesno("No, they differ.", "yes")
+    assert not reasoning.grade_yesno("maybe", "yes")
+
+
+def test_judge_answer_mock():
+    from evals.gpt_oracle import judge_answer
+
+    class _Judge:
+        def chat(self, system, user, max_tokens=None):
+            # inspect only the candidate line: correct iff it says 'politician'
+            cand = user.split("Candidate answer:")[1].split("\n")[0].lower()
+            return "YES" if "politician" in cand else "NO"
+
+    j = _Judge()
+    assert judge_answer(j, "occupation of X?", "politician", "a politician")
+    assert not judge_answer(j, "occupation of X?", "politician", "author")
+    assert not judge_answer(j, "q", "ref", "")   # empty candidate short-circuits
+
+
 def test_helpers():
     assert clean_value('  "Albert Brooks."\nextra ') == "Albert Brooks"
     assert answer_matches("albert brooks", ["Albert Brooks", "Al Brooks"])
@@ -234,3 +269,13 @@ def test_end_to_end_tiny(tmp_path):
         assert "all" in agg and agg["all"]["n"] == len(items)
         assert len(res["texts"]) == len(items)
         assert 0.0 <= agg["all"]["answer"] <= 1.0
+
+    # reason-over-facts eval runs on the same tiny model
+    from corpusgen.realfact import load_realfacts
+    from evals.reasoning import generate_reasoning_items, score_reasoning
+
+    r_items = generate_reasoning_items(load_realfacts(REALFACTS), n=8, seed=0, client=None)
+    rres = score_reasoning(model, tok, r_items, "cpu", max_new=8)
+    assert rres["n"] == len(r_items)
+    assert 0.0 <= rres["acc"] <= 1.0
+    assert 0.5 <= rres["majority_baseline"] <= 1.0

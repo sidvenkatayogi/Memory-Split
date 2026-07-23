@@ -100,20 +100,21 @@ class GatewayClient:
             base_url=base_url or os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL),
         )
 
-    def answer(self, question: str) -> str:
+    def chat(self, system: str, user: str, max_tokens: int | None = None) -> str:
+        """Generic chat completion with retry/backoff; returns raw text."""
         last_err: Exception | None = None
         for attempt in range(self.max_retries):
             try:
                 resp = self._client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": question},
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
                     ],
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_tokens=max_tokens or self.max_tokens,
                 )
-                return clean_value(resp.choices[0].message.content or "")
+                return resp.choices[0].message.content or ""
             except Exception as err:  # noqa: BLE001 - surface after retries
                 last_err = err
                 time.sleep(min(2 ** attempt, 8))
@@ -121,9 +122,33 @@ class GatewayClient:
             f"gateway call failed after {self.max_retries} retries: {last_err}"
         )
 
+    def answer(self, question: str) -> str:
+        return clean_value(self.chat(_SYSTEM_PROMPT, question))
+
     def smoke(self, question: str = "What is the capital of France?") -> str:
         """One call to confirm creds/model path end-to-end."""
         return self.answer(question)
+
+
+_JUDGE_SYSTEM = (
+    "You grade short answers to factual/reasoning questions. Given the question, "
+    "the reference (correct) answer, and a candidate answer, decide whether the "
+    "candidate is correct — accept paraphrases, aliases, and equivalent phrasings "
+    "(e.g. 'soccer' == 'association football', 'US' == 'United States'). Reply with "
+    "exactly one word: YES or NO."
+)
+
+
+def judge_answer(client, question: str, reference: str, candidate: str) -> bool:
+    """LLM-as-judge: is `candidate` a correct answer to `question` given the
+    reference? Semantic, so it credits correct-but-differently-phrased answers
+    that exact/substring matching misses. Empty candidate is always NO."""
+    if not candidate or not candidate.strip():
+        return False
+    user = (f"Question: {question}\nReference answer: {reference}\n"
+            f"Candidate answer: {candidate}\nIs the candidate correct? YES or NO.")
+    verdict = client.chat(_JUDGE_SYSTEM, user, max_tokens=4).strip().upper()
+    return verdict.startswith("Y")
 
 
 class GPTOracle:

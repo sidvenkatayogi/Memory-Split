@@ -52,6 +52,7 @@ CORPUS_DIR = POC_DIR / "corpus"
 RUNS_DIR = PERSIST_DIR / "runs"
 REALFACTS_PATH = ROOT / "data" / "realfacts" / "popqa_clean.jsonl"
 GOLDEN_PATH = PERSIST_DIR / "golden_knowledge.jsonl"
+REASON_ITEMS_PATH = PERSIST_DIR / "reasoning_items.jsonl"
 RESULTS_PATH = PERSIST_DIR / "poc_results.json"
 FIGURE_PATH = PERSIST_DIR / "poc_figure.png"
 
@@ -272,16 +273,52 @@ def stage_eval(args) -> dict:
         },
     }
 
+    scored = {"dense_closed_book": dense_closed, "dense_rag_oracle": dense_rag,
+              "split_gpt_oracle": split_oracle}
+
     # Upper bound: SPLIT with the exact PopQA gold injected.
     if args.gold_oracle:
         gold_by_qid = {it.qid: it.meta["obj"] for it in items}
         split_gold = score_items_oracle(split, tok, items, gold_by_qid, device, max_new=EVAL_MAX_NEW)
         results["factqa"]["split_gold_oracle"] = _factqa_summary(split_gold)
+        scored["split_gold_oracle"] = split_gold
 
     if GOLDEN_PATH.exists():
         rows = [json.loads(line) for line in open(GOLDEN_PATH) if line.strip()]
         if rows:
             results["gpt_fidelity"] = sum(r["matched_gold"] for r in rows) / len(rows)
+
+    # LLM-as-judge re-grade: credits paraphrases/aliases that string-matching
+    # misses (the likely cause of an under-counted GPT fidelity).
+    if args.judge:
+        from evals.gpt_oracle import (
+            GatewayClient,
+            _question_from_prompt,
+            judge_answer,
+        )
+        from evals.scorers import parse_answer
+
+        client = GatewayClient(model=args.gpt_model)
+        for name, sc in scored.items():
+            per: dict[str, list[bool]] = {"all": [], "heldout": [], "seen": []}
+            for it, text in zip(items, sc["texts"]):
+                pred = parse_answer(text) or ""
+                ok = judge_answer(client, _question_from_prompt(it),
+                                  it.meta["obj"], pred)
+                per["all"].append(ok)
+                per[it.meta["split"]].append(ok)
+            for split_name, vals in per.items():
+                if vals:
+                    results["factqa"][name].setdefault(split_name, {})[
+                        "answer_judge"] = sum(vals) / len(vals)
+        if GOLDEN_PATH.exists():
+            grows = [json.loads(l) for l in open(GOLDEN_PATH) if l.strip()]
+            if grows:
+                jud = sum(judge_answer(client, r["question"], r["gold_obj"],
+                                       r["gpt_answer"]) for r in grows) / len(grows)
+                results["gpt_fidelity_judge"] = jud
+        print(f"[eval] judge re-grade done (gpt_fidelity_judge="
+              f"{results.get('gpt_fidelity_judge', float('nan')):.3f})")
 
     POC_DIR.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_PATH, "w") as f:
@@ -289,6 +326,45 @@ def stage_eval(args) -> dict:
     print(f"[eval] wrote {RESULTS_PATH}")
     _print_table(results)
     return results
+
+
+def stage_reason(args) -> dict:
+    """Reason-over-facts eval: GPT-phrased compositional yes/no questions over
+    real fact pairs, both arms answer in-context (RAG). Reuses trained models."""
+    from corpusgen import realfact
+    from evals.reasoning import generate_reasoning_items, score_reasoning
+
+    device = pick_device(args.device)
+    tok = get_tok()
+    facts = realfact.load_realfacts(REALFACTS_PATH)
+
+    client = None
+    if os.environ.get("OPENAI_API_KEY"):
+        from evals.gpt_oracle import GatewayClient
+        client = GatewayClient(model=args.gpt_model)
+    items = generate_reasoning_items(facts, args.n_reason, seed=0,
+                                     cache_path=REASON_ITEMS_PATH, client=client)
+    print(f"[reason] {len(items)} compositional yes/no items "
+          f"({'GPT-phrased' if client else 'templated'})")
+
+    dense = _load_model(_run_dir(args.model, "dense"), device)
+    split = _load_model(_run_dir(args.model, "split"), device)
+    dres = score_reasoning(dense, tok, items, device)
+    sres = score_reasoning(split, tok, items, device)
+
+    block = {"n": len(items), "kind": "same_relation_yesno",
+             "majority_baseline": dres["majority_baseline"],
+             "dense": dres["acc"], "split": sres["acc"]}
+    results = json.load(open(RESULTS_PATH)) if RESULTS_PATH.exists() else {}
+    results["reasoning_facts"] = block
+    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS_PATH, "w") as f:
+        json.dump(results, f, indent=2)
+    print("\n=== Reason-over-facts (in-context; combine 2 facts) ===")
+    print(f"(majority-class baseline: {block['majority_baseline']*100:.0f}%)")
+    print(f"{'dense':<10}{dres['acc']*100:11.1f}%")
+    print(f"{'split':<10}{sres['acc']*100:11.1f}%")
+    return block
 
 
 def _factqa_summary(scored: dict) -> dict:
@@ -309,32 +385,47 @@ def _factqa_summary(scored: dict) -> dict:
 
 
 def _print_table(results: dict) -> None:
-    fq = results["factqa"]
-    print("\n=== Fact-QA answer accuracy (optimal retriever) ===")
-    print(f"{'condition':<22}{'all':>16}{'held-out':>16}{'seen':>16}")
     labels = {
         "dense_closed_book": "DENSE @ closed-book",
         "dense_rag_oracle": "DENSE + oracle (RAG)",
         "split_gpt_oracle": "SPLIT @ GPT-oracle",
         "split_gold_oracle": "SPLIT @ gold (upper)",
     }
-    for key, label in labels.items():
-        if key not in fq:
-            continue
-        cells = []
-        for split in ("all", "heldout", "seen"):
-            v = fq[key].get(split)
-            cells.append(f"{v['answer']*100:6.1f}% (n={v['n']})" if v else " - ")
-        print(f"{label:<22}" + "".join(f"{c:>16}" for c in cells))
+    fq = results.get("factqa")
+    if fq:
+        has_judge = any("answer_judge" in fq[k].get("all", {}) for k in fq)
+        metric = "answer_judge" if has_judge else "answer"
+        title = "judge-graded" if has_judge else "string-match"
+        print(f"\n=== Fact-QA answer accuracy ({title}) ===")
+        print(f"{'condition':<22}{'all':>16}{'held-out':>16}{'seen':>16}")
+        for key, label in labels.items():
+            if key not in fq:
+                continue
+            cells = []
+            for split in ("all", "heldout", "seen"):
+                v = fq[key].get(split)
+                val = v.get(metric, v.get("answer")) if v else None
+                cells.append(f"{val*100:6.1f}% (n={v['n']})" if v else " - ")
+            print(f"{label:<22}" + "".join(f"{c:>16}" for c in cells))
     if "gpt_fidelity" in results:
-        print(f"\nGPT-5.6-sol fidelity vs PopQA gold: {results['gpt_fidelity']*100:.1f}%")
-    r = results["reasoning"]
-    print("\n=== Knowledge-free reasoning composite (supporting) ===")
-    print(f"{'arm':<10}{'igsm':>10}{'deduction':>12}{'composite':>12}")
-    for arm in ("dense", "split"):
-        ra = r[arm]
-        print(f"{arm:<10}{ra['igsm']['acc']*100:9.1f}%{ra['deduction']['acc']*100:11.1f}%"
-              f"{ra['composite']*100:11.1f}%")
+        line = f"\nGPT-5.6-sol fidelity vs PopQA gold: {results['gpt_fidelity']*100:.1f}% (string-match)"
+        if "gpt_fidelity_judge" in results:
+            line += f", {results['gpt_fidelity_judge']*100:.1f}% (judge)"
+        print(line)
+    r = results.get("reasoning")
+    if r:
+        print("\n=== Knowledge-free reasoning composite (supporting) ===")
+        print(f"{'arm':<10}{'igsm':>10}{'deduction':>12}{'composite':>12}")
+        for arm in ("dense", "split"):
+            ra = r[arm]
+            print(f"{arm:<10}{ra['igsm']['acc']*100:9.1f}%{ra['deduction']['acc']*100:11.1f}%"
+                  f"{ra['composite']*100:11.1f}%")
+    rf = results.get("reasoning_facts")
+    if rf:
+        print("\n=== Reason-over-facts (in-context; combine 2 facts) ===")
+        print(f"(majority-class baseline {rf['majority_baseline']*100:.0f}%, n={rf['n']})")
+        print(f"{'dense':<10}{rf['dense']*100:11.1f}%")
+        print(f"{'split':<10}{rf['split']*100:11.1f}%")
 
 
 def stage_report(args) -> None:
@@ -366,8 +457,12 @@ def _make_figure(results: dict, path: Path) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
     x = range(len(splits))
     width = 0.8 / len(series)
+    def _cell(key, s):
+        v = fq.get(key, {}).get(s, {})
+        return v.get("answer_judge", v.get("answer", 0.0)) * 100
+
     for i, (label, key, color) in enumerate(series):
-        vals = [fq.get(key, {}).get(s, {}).get("answer", 0.0) * 100 for s in splits]
+        vals = [_cell(key, s) for s in splits]
         ax1.bar([xi + i * width for xi in x], vals, width, label=label, color=color)
     ax1.set_xticks([xi + width * (len(series) - 1) / 2 for xi in x])
     ax1.set_xticklabels(["all", "held-out", "seen"])
@@ -376,13 +471,30 @@ def _make_figure(results: dict, path: Path) -> None:
     ax1.set_title("Fact-QA: optimal retriever vs parametric recall")
     ax1.legend(fontsize=8, frameon=False)
 
-    r = results["reasoning"]
-    arms = ["dense", "split"]
-    comp = [r[a]["composite"] * 100 for a in arms]
-    ax2.bar(arms, comp, color=["#8c8c8c", "#3b6fb0"], width=0.6)
-    ax2.set_ylabel("composite accuracy (%)")
+    # Reasoning panel: knowledge-free composite + (if present) reason-over-facts,
+    # dense vs split.
+    groups, dvals, svals = [], [], []
+    if results.get("reasoning"):
+        groups.append("knowledge-free\n(iGSM+ded)")
+        dvals.append(results["reasoning"]["dense"]["composite"] * 100)
+        svals.append(results["reasoning"]["split"]["composite"] * 100)
+    rf = results.get("reasoning_facts")
+    if rf:
+        groups.append("reason-over-facts\n(in-context)")
+        dvals.append(rf["dense"] * 100)
+        svals.append(rf["split"] * 100)
+    gx = range(len(groups))
+    ax2.bar([i - 0.2 for i in gx], dvals, 0.4, label="dense", color="#8c8c8c")
+    ax2.bar([i + 0.2 for i in gx], svals, 0.4, label="split", color="#3b6fb0")
+    if rf:
+        ax2.axhline(rf["majority_baseline"] * 100, ls="--", lw=1, color="#c0392b",
+                    label="majority baseline")
+    ax2.set_xticks(list(gx))
+    ax2.set_xticklabels(groups, fontsize=8)
+    ax2.set_ylabel("accuracy (%)")
     ax2.set_ylim(0, 100)
-    ax2.set_title("Knowledge-free reasoning (iGSM + deduction)")
+    ax2.set_title("Reasoning (dense vs split)")
+    ax2.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -395,7 +507,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", default="all",
-                    choices=["all", "build", "train", "gen-golden", "eval", "report"])
+                    choices=["all", "build", "train", "gen-golden", "eval",
+                             "reason", "report"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     ap.add_argument("--model", default="d160m", choices=list(POC_PRESETS),
                     help="model scale (matches the team: d160m/d360m; toy = pilot). "
@@ -416,10 +529,15 @@ def main() -> None:
     ap.add_argument("--seen", type=int, default=25, help="seen fact-QA eval items")
     ap.add_argument("--reason-eval", type=int, default=50,
                     help="igsm/deduction eval items each")
+    ap.add_argument("--n-reason", type=int, default=50,
+                    help="reason-over-facts (compositional) eval items")
     # eval knobs
     ap.add_argument("--limit", type=int, default=0, help="cap fact-QA eval items")
     ap.add_argument("--gold-oracle", action="store_true",
                     help="also report the SPLIT upper bound with PopQA gold injected")
+    ap.add_argument("--judge", action="store_true",
+                    help="LLM-as-judge re-grade of fact-QA (credits paraphrases "
+                         "string-match misses); needs TrueFoundry creds")
     # gpt knobs
     ap.add_argument("--gpt-model", default=None, help="override gateway model path")
     ap.add_argument("--ground-truth-fallback", action="store_true",
@@ -435,6 +553,8 @@ def main() -> None:
         stage_gen_golden(args)
     elif args.stage == "eval":
         stage_eval(args)
+    elif args.stage == "reason":
+        stage_reason(args)
     elif args.stage == "report":
         stage_report(args)
     else:  # all
@@ -442,6 +562,7 @@ def main() -> None:
         stage_train(args)
         stage_gen_golden(args)
         stage_eval(args)
+        stage_reason(args)
         stage_report(args)
 
 
