@@ -20,7 +20,7 @@ from pathlib import Path
 
 from corpusgen.records import QAItem
 from evals.generate import generate_batch_with_stats
-from evals.scorers import normalize_answer, parse_answer, score_items
+from evals.scorers import normalize_answer, parse_answer
 from organizer.store import normalize
 
 _DB_START = "<|db_start|>"
@@ -90,16 +90,28 @@ def run_two_hop(model, tok, items, organizer, device, max_new: int = 96,
 
 def run_singlehop(model, tok, items, organizer, device, max_new: int = 24,
                   batch_size: int = 64) -> dict:
-    """Exact-match single-hop probes; returns {qid: correct} + per-hop summary."""
-    rows, _ = score_items(model, tok, items, organizer, device,
-                          max_new=max_new, batch_size=batch_size)
-    correct = {r["qid"]: r["correct"] for r in rows}
+    """Single-hop fact-access probes; returns {qid: correct} + per-hop summary.
+
+    Probes end mid-sentence ("{name}'s {relation} is"), so the answer is the
+    generated continuation, NOT text after an "Answer:" tag. Score by whether
+    the continuation leads with the gold value (dense) or contains it (split,
+    where the value arrives inside a forced <|db_*|> lookup span). This matches
+    the recall convention in evals/recall.py rather than the Answer:-tag parser.
+    """
+    correct: dict[str, bool] = {}
     summ: dict[str, dict] = {}
-    for r in rows:
-        key = f"{r['meta'].get('population')}-hop{r['meta'].get('hop')}"
-        s = summ.setdefault(key, {"n": 0, "correct": 0})
-        s["n"] += 1
-        s["correct"] += int(r["correct"])
+    for lo in range(0, len(items), batch_size):
+        chunk = items[lo: lo + batch_size]
+        texts, _ = generate_batch_with_stats(
+            model, tok, [it.prompt for it in chunk], max_new, organizer, device)
+        for it, gen in zip(chunk, texts):
+            g, a = normalize_answer(gen), normalize_answer(it.answer)
+            ok = bool(a) and (g.startswith(a) or a in g)
+            correct[it.qid] = bool(ok)
+            key = f"{it.meta.get('population')}-hop{it.meta.get('hop')}"
+            s = summ.setdefault(key, {"n": 0, "correct": 0})
+            s["n"] += 1
+            s["correct"] += int(ok)
     return {"correct": correct, "by_group": {
         k: {"n": v["n"], "accuracy": v["correct"] / v["n"] if v["n"] else 0.0}
         for k, v in summ.items()}}
