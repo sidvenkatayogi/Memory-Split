@@ -21,23 +21,30 @@ Answer: Xavier Dolan                                  <- loss ON for both arms
 ```
 
 Facts are real Wikidata triples (PopQA, from the team's `corpusgen/realfact.py`).
-Two open-book tasks: **fact-QA** (single-hop) and **reason-over-facts** (yes/no
-comparison over two facts — the answer isn't any single fact, so it requires
-combining them).
+Three open-book tasks:
+- **fact-QA** (single-hop): recall/copy one fact.
+- **reason-over-facts** (yes/no comparison over two facts — the answer isn't any
+  single fact, so it requires combining them).
+- **pure reasoning** (`puremath`): compute a named operation (e.g. `a mod b`);
+  the operation's **definition** is the "relevant fact" that can be given in
+  context ("mod means the remainder…") — a closer starting point, not the answer.
+  Split masks the definition; dense memorizes it.
 
-## Fair evaluation — three conditions
+## Fair evaluation — four conditions
 
-| Condition | facts in prompt? | what it shows |
+Closed-book **and** +context for **both** arms, so "does context help?" is a
+within-arm comparison (which is the point of the pure-reasoning task):
+
+| Condition | context in prompt? | note |
 |---|---|---|
-| **DENSE @ closed-book** | no | parametric recall from weights |
-| **DENSE + context** | yes | dense with facts available |
+| **DENSE @ closed-book** | no | parametric recall / no scaffold |
+| **DENSE + context** | yes | dense with the fact/definition available |
+| **SPLIT @ closed-book** | no | split without context (facts ≈ 0 by construction; meaningful for pure reasoning) |
 | **SPLIT + context** | yes | split's trained mode |
 
 Both arms trained **with** context blocks, so `+context` is in-distribution for
-both — the earlier "split was never trained to read context" asymmetry is gone;
-the only difference is whether facts also live in the weights. (SPLIT @
-closed-book is omitted — split never memorized, so it can't answer without
-context.) Held-out facts (never in training context) test generalization.
+both — no format asymmetry; the only difference is whether the fact also lives
+in the weights. Held-out facts (never in training context) test generalization.
 
 ## How it works
 
@@ -87,8 +94,12 @@ d160m), `--steps`, `--fresh` (retrain), `--judge` (LLM-graded fact-QA),
 - **Reason-over-facts:** the reasoning-capacity test (answer ≠ any single fact),
   shown against the **majority-class baseline** — near-baseline for both arms
   means the signal is weak at this scale.
-- **DENSE + context vs SPLIT + context** is the headline: both get the same facts
-  in context; if SPLIT reasons better, that's freed capacity, not retrieval access.
+- **Pure reasoning (`puremath`):** does the definition-in-context help?
+  Compare **closed-book vs +context within each arm** — if +context > closed-book,
+  the relevant fact (definition) gave the model a closer starting point. Compare
+  **dense vs split** to see whether offloading freed capacity for the computation.
+- **DENSE + context vs SPLIT + context** is the headline across tasks: both get the
+  same context; if SPLIT does better, that's freed capacity, not context access.
 
 **Caveats (honest).** The PopQA fact dose is small (~3k facts), which may not
 stress a 162M model's capacity — the capacity effect can be weak or null here;

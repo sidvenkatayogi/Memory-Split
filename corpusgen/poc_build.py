@@ -54,10 +54,12 @@ class PoCBuildCfg:
     max_facts: int | None = None
     n_exposures: int = 6            # fact-QA exposures (the memorization dose)
     n_reason_train: int = 3000      # comparison training items
+    n_puremath_train: int = 3000    # pure-reasoning training items
     n_bed_docs: int = 800
     n_factqa_heldout: int = 25
     n_factqa_seen: int = 25
     n_reason_eval: int = 50
+    n_puremath_eval: int = 50
     bed_sentences: tuple[int, int] = (4, 8)
 
     def to_dict(self) -> dict:
@@ -98,6 +100,59 @@ def _reason_doc(prop, a, va, b, vb, gold) -> Doc:
                dense_segments=_reason_segs(prop, a, va, b, vb, gold, False),
                split_segments=_reason_segs(prop, a, va, b, vb, gold, True),
                meta={"prop": prop})
+
+
+# pure reasoning: compute a named operation; the operation's DEFINITION is the
+# "relevant fact" that can be provided in context (a closer starting point).
+_OPS = [
+    ("mod", "mod means the remainder after dividing the first number by the second.",
+     lambda a, b: a % b),
+    ("plus", "plus means the sum of the two numbers.", lambda a, b: a + b),
+    ("minus", "minus means the absolute difference of the two numbers.",
+     lambda a, b: abs(a - b)),
+]
+_OP_BY_NAME = {name: (definition, fn) for name, definition, fn in _OPS}
+
+
+def _puremath_segs(question, definition, answer, mask_value: bool):
+    return [
+        ("Context:", False),
+        (f" {definition}", mask_value),                # split masks the DEFINITION
+        (f"\nQuestion: {question}\nAnswer:", False),
+        (f" {answer}", False),                         # the computed answer (reasoning)
+    ]
+
+
+def _puremath_doc(question, definition, answer) -> Doc:
+    return Doc(kind="puremath",
+               dense_segments=_puremath_segs(question, definition, answer, False),
+               split_segments=_puremath_segs(question, definition, answer, True),
+               meta={})
+
+
+def _puremath_pool(lo, hi):
+    pool = []
+    for name, definition, fn in _OPS:
+        for a in range(lo, hi + 1):
+            for b in range(lo, hi + 1):
+                pool.append({"op": name, "a": a, "b": b, "definition": definition,
+                             "question": f"What is {a} {name} {b}?",
+                             "answer": str(fn(a, b))})
+    return pool
+
+
+def gen_puremath(n_train, n_eval, seed, lo=2, hi=12):
+    """Disjoint train/eval over (op, a, b) combos. Eval combos are HELD OUT of
+    training; training samples with replacement (repeats = exposures), so the
+    model learns the operation and eval tests generalization to unseen operands."""
+    rng = random.Random(f"{seed}:puremath")
+    pool = _puremath_pool(lo, hi)
+    rng.shuffle(pool)
+    n_eval = min(n_eval, len(pool) // 4)
+    eval_items = pool[:n_eval]
+    train_pool = pool[n_eval:]
+    train_items = [rng.choice(train_pool) for _ in range(n_train)] if train_pool else []
+    return train_items, eval_items
 
 
 def _toy_bed_docs(n, seed, sent_range) -> list[Doc]:
@@ -176,7 +231,6 @@ def build_poc_corpus(cfg: PoCBuildCfg, tok, out_dir) -> dict:
         facts = sorted(facts, key=lambda f: (f.prop, f.subj))
         facts = random.Random(f"{cfg.split_seed}:cap").sample(facts, cfg.max_facts)
     seen, heldout = realfact.split_by_relation(facts, cfg.frac, seed=cfg.split_seed)
-    by_subj_prop = {(f.subj, f.prop): f for f in facts}
 
     # ---- training docs (all open-book; split masks the context value) ----
     factqa_docs = [
@@ -186,9 +240,13 @@ def build_poc_corpus(cfg: PoCBuildCfg, tok, out_dir) -> dict:
     train_pairs = make_pairs(seen, cfg.n_reason_train, cfg.render_seed)
     reason_docs = [_reason_doc(p, a, va, b, vb, "yes" if va == vb else "no")
                    for (p, a, va, b, vb) in train_pairs]
+    puremath_train, puremath_eval_raw = gen_puremath(
+        cfg.n_puremath_train, cfg.n_puremath_eval, cfg.render_seed)
+    puremath_docs = [_puremath_doc(it["question"], it["definition"], it["answer"])
+                     for it in puremath_train]
     bed_docs = _toy_bed_docs(cfg.n_bed_docs, cfg.render_seed, cfg.bed_sentences)
 
-    docs = factqa_docs + reason_docs + bed_docs
+    docs = factqa_docs + reason_docs + puremath_docs + bed_docs
     random.Random(cfg.shuffle_seed).shuffle(docs)
 
     arm_reports = {}
@@ -222,16 +280,23 @@ def build_poc_corpus(cfg: PoCBuildCfg, tok, out_dir) -> dict:
                             "question": f"Do {a} and {b} have the same {p}?",
                             "answer": "yes" if va == vb else "no"})
 
+    puremath_eval = [{"qid": f"pm-{i}", "task": "puremath", "split": "heldout",
+                      "op": it["op"], "question": it["question"],
+                      "definition": it["definition"], "answer": it["answer"]}
+                     for i, it in enumerate(puremath_eval_raw)]
+
     _write_jsonl(factqa_eval, out_dir / "eval" / "factqa.jsonl")
     _write_jsonl(reason_eval, out_dir / "eval" / "reason.jsonl")
+    _write_jsonl(puremath_eval, out_dir / "eval" / "puremath.jsonl")
 
     report = {
         "cfg": cfg.to_dict(),
         "n_seen": len(seen), "n_heldout": len(heldout),
         "component_docs": {"factqa": len(factqa_docs), "reason": len(reason_docs),
-                           "bed": len(bed_docs)},
+                           "puremath": len(puremath_docs), "bed": len(bed_docs)},
         "arms": arm_reports,
-        "eval_counts": {"factqa": len(factqa_eval), "reason": len(reason_eval)},
+        "eval_counts": {"factqa": len(factqa_eval), "reason": len(reason_eval),
+                        "puremath": len(puremath_eval)},
     }
     with open(out_dir / "build_report.json", "w") as f:
         json.dump(report, f, indent=2)

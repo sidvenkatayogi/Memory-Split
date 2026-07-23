@@ -25,8 +25,9 @@ pytestmark = pytest.mark.skipif(not REALFACTS.exists(), reason="popqa_clean.json
 
 def _micro_cfg() -> PoCBuildCfg:
     return PoCBuildCfg(realfacts_path=str(REALFACTS), max_facts=80, n_exposures=2,
-                       n_reason_train=40, n_bed_docs=40, n_factqa_heldout=8,
-                       n_factqa_seen=8, n_reason_eval=8)
+                       n_reason_train=40, n_puremath_train=40, n_bed_docs=40,
+                       n_factqa_heldout=8, n_factqa_seen=8, n_reason_eval=8,
+                       n_puremath_eval=8)
 
 
 def test_build_masks_only_split(tmp_path):
@@ -41,11 +42,14 @@ def test_build_masks_only_split(tmp_path):
 
     fq = [json.loads(l) for l in open(c / "eval" / "factqa.jsonl")]
     rs = [json.loads(l) for l in open(c / "eval" / "reason.jsonl")]
-    assert fq and rs
+    pm = [json.loads(l) for l in open(c / "eval" / "puremath.jsonl")]
+    assert fq and rs and pm
     assert all(it["task"] == "factqa" and {"subj", "prop", "obj", "question",
                "possible_answers", "split"} <= it.keys() for it in fq)
     assert all(it["task"] == "reason" and it["answer"] in ("yes", "no")
                and {"a", "va", "b", "vb", "prop"} <= it.keys() for it in rs)
+    assert all(it["task"] == "puremath" and {"question", "definition", "answer"}
+               <= it.keys() for it in pm)
 
 
 def test_make_pairs():
@@ -72,6 +76,14 @@ def test_prompts_and_grading():
     assert "The country of A is France." in p and "The country of B is France." in p
     assert context_eval._grade(rs, "yes, both France", None)
     assert not context_eval._grade(rs, "no", None)
+
+    pm = {"task": "puremath", "split": "heldout", "op": "mod",
+          "question": "What is 7 mod 3?", "definition": "mod means the remainder.",
+          "answer": "1"}
+    assert "Context: mod means the remainder." in context_eval.build_prompt(pm, True)
+    assert "Context:" not in context_eval.build_prompt(pm, False)
+    assert context_eval._grade(pm, "Answer: 1", None)
+    assert not context_eval._grade(pm, "Answer: 2", None)
 
 
 def test_judge_and_helpers():
@@ -110,10 +122,10 @@ def test_end_to_end_tiny(tmp_path):
     trainer.train_steps()
     net = trainer.model.eval()
 
-    items = ([json.loads(l) for l in open(corpus / "eval" / "factqa.jsonl")]
-             + [json.loads(l) for l in open(corpus / "eval" / "reason.jsonl")])
+    items = [json.loads(l) for t in ("factqa", "reason", "puremath")
+             for l in open(corpus / "eval" / f"{t}.jsonl")]
     for ctx in (False, True):
         out = context_eval.score(net, tok, items, "cpu", context=ctx, max_new=16)
-        for task in ("factqa", "reason"):
+        for task in ("factqa", "reason", "puremath"):
             assert "all" in out[task] and out[task]["all"]["n"] > 0
             assert 0.0 <= out[task]["all"]["acc"] <= 1.0

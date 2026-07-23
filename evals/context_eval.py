@@ -42,16 +42,21 @@ class _VocabGuard:
 
 def build_prompt(item: dict, context: bool) -> str:
     q = item["question"]
-    if item["task"] == "factqa":
+    task = item["task"]
+    if task == "factqa":
         if context:
             return (f"Context: The {item['prop']} of {item['subj']} is "
                     f"{item['obj']}.\nQuestion: {q}\nAnswer:")
         return f"Question: {q}\nAnswer:"
-    # reason
+    if task == "reason":
+        if context:
+            return (f"Context: The {item['prop']} of {item['a']} is {item['va']}. "
+                    f"The {item['prop']} of {item['b']} is {item['vb']}.\n"
+                    f"Question: {q}\nAnswer:")
+        return f"Question: {q}\nAnswer:"
+    # puremath: context = the operation's definition (the "relevant fact")
     if context:
-        return (f"Context: The {item['prop']} of {item['a']} is {item['va']}. "
-                f"The {item['prop']} of {item['b']} is {item['vb']}.\n"
-                f"Question: {q}\nAnswer:")
+        return f"Context: {item['definition']}\nQuestion: {q}\nAnswer:"
     return f"Question: {q}\nAnswer:"
 
 
@@ -59,6 +64,9 @@ def _grade(item: dict, text: str, client) -> bool:
     if item["task"] == "reason":
         m = re.search(r"\b(yes|no)\b", text.lower())
         return bool(m) and m.group(1) == item["answer"]
+    if item["task"] == "puremath":
+        m = re.search(r"-?\d+", parse_answer(text) or text)
+        return bool(m) and m.group() == str(item["answer"])
     pred = parse_answer(text) or text
     if client is not None:
         return judge_answer(client, item["question"], item["obj"], pred)

@@ -123,14 +123,16 @@ def stage_build(args) -> dict:
     cfg = PoCBuildCfg(
         realfacts_path=str(REALFACTS_PATH), max_facts=args.max_facts,
         n_exposures=args.exposures, n_reason_train=args.reason_train,
-        n_bed_docs=args.bed_docs, n_factqa_heldout=args.heldout,
-        n_factqa_seen=args.seen, n_reason_eval=args.reason_eval,
+        n_puremath_train=args.puremath_train, n_bed_docs=args.bed_docs,
+        n_factqa_heldout=args.heldout, n_factqa_seen=args.seen,
+        n_reason_eval=args.reason_eval, n_puremath_eval=args.puremath_eval,
     )
     r = build_poc_corpus(cfg, tok, CORPUS_DIR)
-    print(f"[build] docs: factqa={r['component_docs']['factqa']} "
-          f"reason={r['component_docs']['reason']} bed={r['component_docs']['bed']}; "
-          f"seen={r['n_seen']} heldout={r['n_heldout']}; "
-          f"eval factqa={r['eval_counts']['factqa']} reason={r['eval_counts']['reason']}")
+    d, e = r["component_docs"], r["eval_counts"]
+    print(f"[build] docs: factqa={d['factqa']} reason={d['reason']} "
+          f"puremath={d['puremath']} bed={d['bed']}; seen={r['n_seen']} "
+          f"heldout={r['n_heldout']}; eval factqa={e['factqa']} reason={e['reason']} "
+          f"puremath={e['puremath']}")
     for arm in ARMS:
         a = r["arms"][arm]
         print(f"[build] {arm}: {a['n_tokens']} tokens, masked {a['masked_token_frac']:.3f}")
@@ -173,10 +175,11 @@ def stage_eval(args) -> dict:
     tok = get_tok()
     factqa = _load_items(CORPUS_DIR / "eval" / "factqa.jsonl")
     reason = _load_items(CORPUS_DIR / "eval" / "reason.jsonl")
+    puremath = _load_items(CORPUS_DIR / "eval" / "puremath.jsonl")
     if args.limit:
-        factqa = factqa[: args.limit]
-        reason = reason[: args.limit]
-    items = factqa + reason
+        factqa, reason, puremath = (factqa[: args.limit], reason[: args.limit],
+                                    puremath[: args.limit])
+    items = factqa + reason + puremath
 
     client = None
     if args.judge:
@@ -189,17 +192,21 @@ def stage_eval(args) -> dict:
     dense = _load_model(_run_dir(args.model, "dense"), device)
     split = _load_model(_run_dir(args.model, "split"), device)
 
+    # closed-book AND +context for BOTH arms, so "does context help?" is a
+    # within-arm comparison (needed for the pure-reasoning task).
     conditions = {
         "dense_closed": context_eval.score(dense, tok, items, device, context=False,
                                             client=client, max_new=MAX_NEW),
         "dense_context": context_eval.score(dense, tok, items, device, context=True,
                                              client=client, max_new=MAX_NEW),
+        "split_closed": context_eval.score(split, tok, items, device, context=False,
+                                            client=client, max_new=MAX_NEW),
         "split_context": context_eval.score(split, tok, items, device, context=True,
                                              client=client, max_new=MAX_NEW),
     }
     results = {
         "model": args.model,
-        "n_factqa": len(factqa), "n_reason": len(reason),
+        "n_factqa": len(factqa), "n_reason": len(reason), "n_puremath": len(puremath),
         "reason_majority_baseline": _majority_baseline(reason),
         "gpt_judge": client is not None,
         "conditions": conditions,
@@ -216,6 +223,7 @@ def stage_eval(args) -> dict:
 
 _COND_LABELS = {"dense_closed": "DENSE @ closed-book",
                 "dense_context": "DENSE + context",
+                "split_closed": "SPLIT @ closed-book",
                 "split_context": "SPLIT + context"}
 
 
@@ -232,12 +240,17 @@ def _print_table(results: dict) -> None:
             cells.append(f"{v['acc']*100:6.1f}% (n={v['n']})" if v else " - ")
         print(f"{label:<22}" + "".join(f"{c:>14}" for c in cells))
 
-    print(f"\n=== Reason-over-facts (yes/no; combine 2 facts) ===")
+    def _one(task):
+        print(f"{'condition':<22}{'accuracy':>12}")
+        for key, label in _COND_LABELS.items():
+            rv = conds.get(key, {}).get(task, {}).get("all")
+            print(f"{label:<22}{(rv['acc']*100 if rv else 0):11.1f}%")
+
+    print(f"\n=== Reason-over-facts (yes/no; combine 2 context facts) ===")
     print(f"(majority-class baseline {results.get('reason_majority_baseline',0)*100:.0f}%)")
-    print(f"{'condition':<22}{'accuracy':>12}")
-    for key, label in _COND_LABELS.items():
-        rv = conds.get(key, {}).get("reason", {}).get("all")
-        print(f"{label:<22}{(rv['acc']*100 if rv else 0):11.1f}%")
+    _one("reason")
+    print(f"\n=== Pure reasoning (compute op; context = the definition) ===")
+    _one("puremath")
 
 
 def stage_report(args) -> None:
@@ -256,34 +269,25 @@ def _make_figure(results: dict, path: Path) -> None:
 
     conds = list(_COND_LABELS)
     colors = {"dense_closed": "#8c8c8c", "dense_context": "#c48a2c",
-              "split_context": "#3b6fb0"}
+              "split_closed": "#6ba368", "split_context": "#3b6fb0"}
     c = results["conditions"]
+    xlabels = [_COND_LABELS[k].replace(" @ ", "\n").replace(" + ", "\n+") for k in conds]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.4))
-    # fact-QA: all/held-out/seen
-    splits = ["all", "heldout", "seen"]
-    w = 0.8 / len(conds)
-    for i, k in enumerate(conds):
-        fq = c.get(k, {}).get("factqa", {})
-        vals = [fq.get(s, {}).get("acc", 0.0) * 100 for s in splits]
-        ax1.bar([x + i * w for x in range(len(splits))], vals, w,
-                label=_COND_LABELS[k], color=colors[k])
-    ax1.set_xticks([x + w for x in range(len(splits))])
-    ax1.set_xticklabels(["all", "held-out", "seen"])
-    ax1.set_ylabel("answer accuracy (%)"); ax1.set_ylim(0, 100)
-    ax1.set_title("Fact-QA (in-context)")
-    ax1.legend(fontsize=8, frameon=False)
-    # reason: one bar per condition + baseline
-    rvals = [c.get(k, {}).get("reason", {}).get("all", {}).get("acc", 0.0) * 100 for k in conds]
-    ax2.bar(range(len(conds)), rvals, 0.6, color=[colors[k] for k in conds])
-    ax2.axhline(results.get("reason_majority_baseline", 0.5) * 100, ls="--", lw=1,
-                color="#c0392b", label="majority baseline")
-    ax2.set_xticks(range(len(conds)))
-    ax2.set_xticklabels([_COND_LABELS[k].replace(" @ ", "\n").replace(" + ", "\n+")
-                         for k in conds], fontsize=8)
-    ax2.set_ylabel("accuracy (%)"); ax2.set_ylim(0, 100)
-    ax2.set_title("Reason-over-facts")
-    ax2.legend(fontsize=8, frameon=False)
+    def _panel(ax, task, title, baseline=None):
+        vals = [c.get(k, {}).get(task, {}).get("all", {}).get("acc", 0.0) * 100 for k in conds]
+        ax.bar(range(len(conds)), vals, 0.62, color=[colors[k] for k in conds])
+        if baseline is not None:
+            ax.axhline(baseline * 100, ls="--", lw=1, color="#c0392b", label="majority")
+            ax.legend(fontsize=8, frameon=False)
+        ax.set_xticks(range(len(conds)))
+        ax.set_xticklabels(xlabels, fontsize=7)
+        ax.set_ylim(0, 100); ax.set_title(title, fontsize=10)
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(14, 4.4))
+    _panel(ax1, "factqa", "Fact-QA (all)")
+    ax1.set_ylabel("accuracy (%)")
+    _panel(ax2, "reason", "Reason-over-facts", results.get("reason_majority_baseline", 0.5))
+    _panel(ax3, "puremath", "Pure reasoning (def=context)")
     fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
 
 
@@ -305,10 +309,12 @@ def main() -> None:
     ap.add_argument("--max-facts", type=int, default=None)
     ap.add_argument("--exposures", type=int, default=6)
     ap.add_argument("--reason-train", type=int, default=3000)
+    ap.add_argument("--puremath-train", type=int, default=3000)
     ap.add_argument("--bed-docs", type=int, default=800)
     ap.add_argument("--heldout", type=int, default=25)
     ap.add_argument("--seen", type=int, default=25)
     ap.add_argument("--reason-eval", type=int, default=50)
+    ap.add_argument("--puremath-eval", type=int, default=50)
     # eval knobs
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--judge", action="store_true",
