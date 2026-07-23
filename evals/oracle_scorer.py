@@ -106,6 +106,43 @@ def score_items_closed_book(model, tok, items, device, max_new: int = 64,
     return {"aggregates": agg, "generation_stats": gen_stats, "texts": texts}
 
 
+def _rag_prompt(item, golden_by_qid) -> str:
+    """Prepend the retrieved golden fact to the item's prompt (RAG baseline)."""
+    meta = item.meta if hasattr(item, "meta") else item["meta"]
+    qid = item.qid if hasattr(item, "qid") else item["qid"]
+    prompt = item.prompt if hasattr(item, "prompt") else item["prompt"]
+    golden = golden_by_qid.get(qid, "")
+    context = f"Context: The {meta['prop']} of {meta['subj']} is {golden}."
+    return f"{context}\n{prompt}"
+
+
+def generate_rag(model, tok, items, golden_by_qid, device, max_new: int = 64,
+                 batch_size: int = 16) -> tuple[list[str], dict]:
+    """Decode with the golden fact injected into the prompt context (store OFF)."""
+    prompts = [_rag_prompt(it, golden_by_qid) for it in items]
+    texts: list[str] = []
+    stats: dict[str, int] = {}
+    for lo in range(0, len(prompts), batch_size):
+        bt, bs = generate_batch_with_stats(
+            model, tok, prompts[lo:lo + batch_size], max_new=max_new,
+            organizer=None, device=device,
+        )
+        texts.extend(bt)
+        _merge_stats(stats, bs)
+    return texts, stats
+
+
+def score_items_rag(model, tok, items, golden_by_qid, device,
+                    max_new: int = 64) -> dict:
+    """DENSE arm + oracle as RAG: the golden fact is given in-context, then the
+    model answers. Tests whether perfect retrieval helps a parametric model too
+    (the control for whether SPLIT's edge is freed capacity or just retrieval).
+    Scored against the original items, so only the model's generation counts."""
+    texts, gen_stats = generate_rag(model, tok, items, golden_by_qid, device, max_new=max_new)
+    agg = keyguess_score_items(items, texts)
+    return {"aggregates": agg, "generation_stats": gen_stats, "texts": texts}
+
+
 def answer_accuracy(aggregates: dict, split: str = "all") -> float:
     """Convenience: the answer-correctness rate for a split group."""
     return aggregates.get(split, {}).get("answer", 0.0)

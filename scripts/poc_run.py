@@ -33,6 +33,7 @@ from evals.oracle_scorer import (
     guard_vocab,
     score_items_closed_book,
     score_items_oracle,
+    score_items_rag,
 )
 from evals.scorers import score_items as generative_score_items
 from train.model import GPT, GPTConfig
@@ -225,15 +226,20 @@ def stage_eval(args) -> dict:
     dense = _load_model(_run_dir(args.model, "dense"), device)
     split = _load_model(_run_dir(args.model, "split"), device)
 
-    # Headline fact-QA: SPLIT @ GPT-oracle vs DENSE @ closed-book.
-    split_oracle = score_items_oracle(split, tok, items, golden, device, max_new=EVAL_MAX_NEW)
+    # Headline fact-QA, three conditions:
+    #   DENSE @ closed-book      - parametric recall only
+    #   DENSE + oracle (RAG)     - dense model given the golden fact in-context
+    #   SPLIT @ GPT-oracle       - split model asks; golden value injected
     dense_closed = score_items_closed_book(dense, tok, items, device, max_new=EVAL_MAX_NEW)
+    dense_rag = score_items_rag(dense, tok, items, golden, device, max_new=EVAL_MAX_NEW)
+    split_oracle = score_items_oracle(split, tok, items, golden, device, max_new=EVAL_MAX_NEW)
 
     results: dict = {
         "n_eval": len(items),
         "factqa": {
-            "split_gpt_oracle": _factqa_summary(split_oracle),
             "dense_closed_book": _factqa_summary(dense_closed),
+            "dense_rag_oracle": _factqa_summary(dense_rag),
+            "split_gpt_oracle": _factqa_summary(split_oracle),
         },
         "reasoning": {
             "dense": _reasoning_composite(dense, tok, device),
@@ -282,8 +288,9 @@ def _print_table(results: dict) -> None:
     print("\n=== Fact-QA answer accuracy (optimal retriever) ===")
     print(f"{'condition':<22}{'all':>16}{'held-out':>16}{'seen':>16}")
     labels = {
-        "split_gpt_oracle": "SPLIT @ GPT-oracle",
         "dense_closed_book": "DENSE @ closed-book",
+        "dense_rag_oracle": "DENSE + oracle (RAG)",
+        "split_gpt_oracle": "SPLIT @ GPT-oracle",
         "split_gold_oracle": "SPLIT @ gold (upper)",
     }
     for key, label in labels.items():
@@ -322,9 +329,10 @@ def _make_figure(results: dict, path: Path) -> None:
 
     fq = results["factqa"]
     splits = ["all", "heldout", "seen"]
-    # Brand-neutral, colorblind-safe pair (dataviz palette style).
+    # Brand-neutral, colorblind-safe series (dataviz palette style).
     series = [
         ("DENSE @ closed-book", "dense_closed_book", "#8c8c8c"),
+        ("DENSE + oracle (RAG)", "dense_rag_oracle", "#c48a2c"),
         ("SPLIT @ GPT-oracle", "split_gpt_oracle", "#3b6fb0"),
     ]
     if "split_gold_oracle" in fq:

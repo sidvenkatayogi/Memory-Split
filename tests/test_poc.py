@@ -24,7 +24,11 @@ from evals.gpt_oracle import (
     generate_golden_knowledge,
     load_golden_knowledge,
 )
-from evals.oracle_scorer import score_items_closed_book, score_items_oracle
+from evals.oracle_scorer import (
+    score_items_closed_book,
+    score_items_oracle,
+    score_items_rag,
+)
 from train.tokenizer import get_tok
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -223,8 +227,9 @@ def test_end_to_end_tiny(tmp_path):
 
     split_res = score_items_oracle(model, tok, items, golden, "cpu", max_new=48)
     dense_res = score_items_closed_book(model, tok, items, "cpu", max_new=48)
+    dense_rag = score_items_rag(model, tok, items, golden, "cpu", max_new=48)
 
-    for res in (split_res, dense_res):
+    for res in (split_res, dense_res, dense_rag):
         agg = res["aggregates"]
         assert "all" in agg and agg["all"]["n"] == len(items)
         assert len(res["texts"]) == len(items)

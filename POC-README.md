@@ -34,9 +34,11 @@ params)**; `--model d360m` (~356M) matches the stretch scale (needs an A100),
   for *any* emitted key (removing the address-construction confound). The
   existing decoder `evals/generate.py` injects the value as the answer text — no
   core change.
-- **Eval** (`evals/oracle_scorer.py`): SPLIT decodes with the per-item oracle;
-  DENSE decodes closed-book. Both scored by `evals/keyguess.py` (alias-tolerant
-  answer match), grouped **seen vs held-out**.
+- **Eval** (`evals/oracle_scorer.py`): three fact-QA conditions —
+  **DENSE @ closed-book** (parametric recall), **DENSE + oracle (RAG)** (the
+  golden fact given in-context), and **SPLIT @ GPT-oracle** (split asks; golden
+  value injected). All scored by `evals/keyguess.py` (alias-tolerant answer
+  match on the model's *generation*), grouped **seen vs held-out**.
 - **Orchestration** (`scripts/poc_run.py`): `build → train → gen-golden → eval →
   report`.
 
@@ -100,6 +102,10 @@ GPT disagrees, making the oracle exactly optimal), `--gpt-model`.
 - **Seen fact-QA:** the fairer capacity comparison — both arms trained on these
   facts; SPLIT should be ≥ DENSE (retrieval is lossless; parametric recall loses
   the long tail).
+- **DENSE + oracle (RAG):** the control. Giving the dense model the same golden
+  fact in-context isolates whether SPLIT's edge is *freed capacity* or just
+  *access to retrieval*. If SPLIT ≥ DENSE+RAG, the split training bought
+  something beyond having a retriever.
 - **Reasoning composite (iGSM + deduction):** the direct capacity-crowding
   signal. Even at d160m this runs on **far fewer tokens than the team's cluster
   runs** (a single Colab GPU overnight, not billions of tokens), so treat it as
