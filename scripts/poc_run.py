@@ -41,7 +41,14 @@ FIGURE_PATH = PERSIST_DIR / "poc_figure.png"
 
 # Model presets matched to the team (train/model.py). Only the loss mask differs
 # between arms. ctx 512 fits a single GPU; global batch via grad accumulation.
+# Small presets exist so a fixed token budget can actually stress capacity
+# (capacity ~ params). NB: with vocab 50304 the embedding matrices dominate at
+# small width (e.g. d128 ~ 13M of ~14M params are embeddings), so below ~toy the
+# transformer (the reasoning engine) gets thin fast — the pilot stage checks
+# whether a given size still reasons above chance before you commit.
 POC_PRESETS = {
+    "micro": {"dims": {"n_layer": 4,  "n_head": 4,  "d_model": 64},   "micro_bs": 8, "lr": 1.5e-3},
+    "mini":  {"dims": {"n_layer": 4,  "n_head": 4,  "d_model": 128},  "micro_bs": 8, "lr": 1.5e-3},
     "toy":   {"dims": {"n_layer": 4,  "n_head": 4,  "d_model": 256},  "micro_bs": 8, "lr": 1.5e-3},
     "d160m": {"dims": {"n_layer": 12, "n_head": 12, "d_model": 768},  "micro_bs": 8, "lr": 1.5e-3},
     "d360m": {"dims": {"n_layer": 20, "n_head": 16, "d_model": 1024}, "micro_bs": 4, "lr": 1.0e-3},
@@ -58,16 +65,16 @@ def _model_dict(name: str) -> dict:
     return {**POC_PRESETS[name]["dims"], "ctx": CTX, "vocab_size": 50304}
 
 
-def _run_dir(model_name: str, arm: str) -> Path:
-    # '_incontext' namespace so these never collide with (or wrongly reuse) the
-    # old DB-design checkpoints.
-    return RUNS_DIR / f"{model_name}_incontext" / arm
+def _run_dir(model_name: str, arm: str, tag: str = "incontext") -> Path:
+    # tag namespaces runs ('incontext' full experiment, 'pilot' reasoning-only)
+    # so they never collide or wrongly reuse each other's checkpoints.
+    return RUNS_DIR / f"{model_name}_{tag}" / arm
 
 
-def _trainer_cfg(arm, steps, device, model_name, ckpt_minutes=10) -> dict:
+def _trainer_cfg(arm, steps, device, model_name, tag="incontext", ckpt_minutes=10) -> dict:
     p = POC_PRESETS[model_name]
     return {
-        "run_id": f"poc_{model_name}_incontext_{arm}",
+        "run_id": f"poc_{model_name}_{tag}_{arm}",
         "arm": arm,
         "model": _model_dict(model_name),
         "train_bin": str(CORPUS_DIR / arm / "train.bin"),
@@ -79,7 +86,7 @@ def _trainer_cfg(arm, steps, device, model_name, ckpt_minutes=10) -> dict:
         "warmup_steps": WARMUP,
         "seed": TRAIN_SEED,
         "device": device,
-        "out_dir": str(_run_dir(model_name, arm)),
+        "out_dir": str(_run_dir(model_name, arm, tag)),
         "log_every": 25, "eval_every": 200, "snap_frac": 0.5,
         "ckpt_minutes": ckpt_minutes,
     }
@@ -160,6 +167,62 @@ def stage_train(args, arms=ARMS) -> None:
               f"micro_bs={cfg['micro_batch_size']} tokens/step={cfg['tokens_per_step']}")
         final = trainer.train_steps()
         print(f"[train] {arm}: done at step {trainer.step} (loss_ema={final:.4f})")
+
+
+def stage_pilot(args) -> dict:
+    """Reasoning-only floor check: train ONE model at `--model` on the reasoning
+    tasks with NO fact-memorization dose (n_exposures=0), then measure whether it
+    reasons above chance. Use this to pick the smallest model that clears the
+    floor before committing to a full (dose) run."""
+    device = pick_device(args.device)
+    tok = get_tok()
+    cfg = PoCBuildCfg(
+        realfacts_path=str(REALFACTS_PATH), max_facts=args.max_facts,
+        n_exposures=0,  # no memorization dose
+        n_reason_train=args.reason_train, n_puremath_train=args.puremath_train,
+        n_bed_docs=args.bed_docs, n_factqa_heldout=args.heldout,
+        n_factqa_seen=args.seen, n_reason_eval=args.reason_eval,
+        n_puremath_eval=args.puremath_eval,
+    )
+    r = build_poc_corpus(cfg, tok, CORPUS_DIR)
+    print(f"[pilot] reasoning-only corpus (no fact dose): "
+          f"reason={r['component_docs']['reason']} "
+          f"puremath={r['component_docs']['puremath']} bed={r['component_docs']['bed']}")
+
+    run_dir = _run_dir(args.model, "dense", tag="pilot")
+    done = _trained_step(run_dir)
+    if (run_dir / "ckpt.pt").exists() and not args.fresh and done >= args.steps:
+        print(f"[pilot] {args.model}: reusing pilot checkpoint at step {done}")
+    else:
+        tcfg = _trainer_cfg("dense", args.steps, device, args.model, tag="pilot",
+                            ckpt_minutes=args.ckpt_minutes)
+        trainer = Trainer(tcfg)
+        n_params = sum(p.numel() for p in trainer.model.parameters())
+        if trainer.ckpt_path.exists() and not args.fresh:
+            trainer.load_ckpt()
+        print(f"[pilot] {args.model}: {n_params/1e6:.1f}M params — training "
+              "reasoning-only")
+        trainer.train_steps()
+
+    model = _load_model(run_dir, device)
+    reason = _load_items(CORPUS_DIR / "eval" / "reason.jsonl")
+    puremath = _load_items(CORPUS_DIR / "eval" / "puremath.jsonl")
+    out = context_eval.score(model, tok, reason + puremath, device, context=True,
+                             max_new=MAX_NEW)
+    r_acc = out.get("reason", {}).get("all", {}).get("acc", 0.0)
+    p_acc = out.get("puremath", {}).get("all", {}).get("acc", 0.0)
+    base = _majority_baseline(reason)
+    usable = (r_acc > base + 0.10) or (p_acc > 0.10)
+    block = {"model": args.model, "reason_acc": r_acc, "puremath_acc": p_acc,
+             "reason_majority_baseline": base, "usable": usable}
+    print(f"\n=== PILOT (reasoning-only, model={args.model}) ===")
+    print(f"reason-over-facts : {r_acc*100:5.1f}%   (majority baseline {base*100:.0f}%)")
+    print(f"pure reasoning    : {p_acc*100:5.1f}%   (chance ~0%)")
+    print(f"verdict: {'ABOVE floor — usable for the dose run' if usable else 'AT/NEAR floor — too small, size up'}")
+    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PERSIST_DIR / f"pilot_{args.model}.json", "w") as f:
+        json.dump(block, f, indent=2)
+    return block
 
 
 def _majority_baseline(reason_items) -> float:
@@ -298,7 +361,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", default="all",
-                    choices=["all", "build", "train", "eval", "report"])
+                    choices=["all", "pilot", "build", "train", "eval", "report"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     ap.add_argument("--model", default="d160m", choices=list(POC_PRESETS),
                     help="scale (team: d160m/d360m; toy = pilot). d360m needs A100")
@@ -323,7 +386,9 @@ def main() -> None:
     args = ap.parse_args()
 
     print(f"[poc] stage={args.stage} device={pick_device(args.device)} model={args.model}")
-    if args.stage == "build":
+    if args.stage == "pilot":
+        stage_pilot(args)
+    elif args.stage == "build":
         stage_build(args)
     elif args.stage == "train":
         stage_train(args)

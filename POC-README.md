@@ -78,12 +78,32 @@ set -a && . ./.env && set +a          # TrueFoundry creds, for --judge
 .venv/bin/python -m pytest tests/test_poc.py -q     # offline wiring tests
 ```
 
+## Picking the model size (the pilot)
+
+Capacity ≈ params, and the real wall is the **token budget**, so at a fixed
+overnight budget a *large* model is barely stressed (d160m sits at ~3% capacity
+utilization) — you want a **small** model so a feasible fact dose actually
+crowds it. But too small and it can't reason at all (below width ~256 the vocab
+embeddings dominate the params and the transformer gets thin). So:
+
+```bash
+python scripts/poc_run.py --stage pilot --model mini   # 13.7M
+python scripts/poc_run.py --stage pilot --model toy    # 29M
+```
+
+`--stage pilot` trains reasoning-only (no fact dose) and reports whether the
+model beats chance. **Pick the smallest size that's ABOVE floor** for the full
+run — that maximizes capacity pressure while keeping the reasoning signal
+measurable. Presets: `micro` 6.7M · `mini` 13.7M · `toy` 29M · `d160m` · `d360m`.
+
 ## Knobs (`scripts/poc_run.py`)
 
-`--stage {build,train,eval,report,all}`, `--model {toy,d160m,d360m}` (default
-d160m), `--steps`, `--fresh` (retrain), `--judge` (LLM-graded fact-QA),
-`--max-facts` (fact dose), `--exposures`, `--reason-train`, `--bed-docs`,
-`--heldout`/`--seen`/`--reason-eval` (eval sizes), `--limit`.
+`--stage {pilot,build,train,eval,report,all}`,
+`--model {micro,mini,toy,d160m,d360m}` (default d160m — but smaller is usually
+right for the capacity test; see the pilot), `--steps`, `--fresh` (retrain),
+`--judge` (LLM-graded fact-QA), `--max-facts` (fact dose), `--exposures`,
+`--reason-train`, `--puremath-train`, `--bed-docs`,
+`--heldout`/`--seen`/`--reason-eval`/`--puremath-eval` (eval sizes), `--limit`.
 
 ## Reading the results
 
