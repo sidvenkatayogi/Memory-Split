@@ -1,9 +1,8 @@
-"""Offline wiring tests for the optimal-retriever PoC (no network, CPU).
+"""Offline wiring tests for the in-context PoC (no network, no DB, CPU).
 
-Covers: corpus build (dense=all-loss / split=masked-values), golden-knowledge
-generation via a mock client, the GPTOracle contract, the value-injection
-mechanism with a scripted model (training-independent), and a micro
-end-to-end build+train+score to prove the eval pipeline runs.
+Covers: corpus build (dense=all-loss / split=masked context values), comparison
+pair generation, the in-context prompt/grade logic, the GPT judge (mocked), and
+a micro end-to-end build+train+score of the three eval conditions.
 """
 
 from __future__ import annotations
@@ -13,236 +12,92 @@ from pathlib import Path
 
 import pytest
 
-from corpusgen.poc_build import PoCBuildCfg, build_poc_corpus
-from corpusgen.records import QAItem
-from evals import keyguess
-from evals.generate import generate_batch_with_stats
-from evals.gpt_oracle import (
-    GPTOracle,
-    answer_matches,
-    clean_value,
-    generate_golden_knowledge,
-    load_golden_knowledge,
-)
-from evals.oracle_scorer import (
-    score_items_closed_book,
-    score_items_oracle,
-    score_items_rag,
-)
+from corpusgen.poc_build import PoCBuildCfg, build_poc_corpus, make_pairs
+from evals import context_eval
+from evals.gpt_oracle import answer_matches, clean_value, judge_answer
 from train.tokenizer import get_tok
 
 ROOT = Path(__file__).resolve().parents[1]
 REALFACTS = ROOT / "data" / "realfacts" / "popqa_clean.jsonl"
 
-pytestmark = pytest.mark.skipif(
-    not REALFACTS.exists(), reason="popqa_clean.jsonl not present"
-)
+pytestmark = pytest.mark.skipif(not REALFACTS.exists(), reason="popqa_clean.jsonl missing")
 
 
 def _micro_cfg() -> PoCBuildCfg:
-    return PoCBuildCfg(
-        realfacts_path=str(REALFACTS),
-        max_facts=80,
-        n_exposures=2,
-        n_igsm_docs=40,
-        n_deduction_docs=40,
-        n_bed_docs=40,
-        n_eval_heldout=8,
-        n_eval_seen=8,
-        n_igsm_eval=8,
-        n_deduction_eval=8,
-    )
+    return PoCBuildCfg(realfacts_path=str(REALFACTS), max_facts=80, n_exposures=2,
+                       n_reason_train=40, n_bed_docs=40, n_factqa_heldout=8,
+                       n_factqa_seen=8, n_reason_eval=8)
 
 
-# ------------------------------------------------------------------ build
-
-
-def test_build_micro_writes_arms_and_evals(tmp_path):
+def test_build_masks_only_split(tmp_path):
     tok = get_tok()
-    report = build_poc_corpus(_micro_cfg(), tok, tmp_path / "corpus")
+    r = build_poc_corpus(_micro_cfg(), tok, tmp_path / "corpus")
     c = tmp_path / "corpus"
-
     for arm in ("dense", "split"):
-        assert (c / arm / "train.bin").exists()
-        assert (c / arm / "train.mask.bin").exists()
-    assert (c / "organizer.jsonl").exists()
-    for stem in ("factqa", "igsm", "deduction"):
-        assert (c / "eval" / f"{stem}.jsonl").exists()
+        assert (c / arm / "train.bin").exists() and (c / arm / "train.mask.bin").exists()
+    # the one toggle: dense has loss everywhere, split masks context fact values
+    assert r["arms"]["dense"]["masked_token_frac"] == 0.0
+    assert r["arms"]["split"]["masked_token_frac"] > 0.0
 
-    # The whole experiment is one toggle: dense has loss everywhere, split
-    # masks fact values.
-    assert report["arms"]["dense"]["masked_token_frac"] == 0.0
-    assert report["arms"]["split"]["masked_token_frac"] > 0.0
-
-    fq = [QAItem(**json.loads(l)) for l in open(c / "eval" / "factqa.jsonl")]
-    assert len(fq) == report["eval_counts"]["factqa"]
-    assert {it.meta["split"] for it in fq} <= {"seen", "heldout"}
-    assert all("possible_answers" in it.meta and "obj" in it.meta for it in fq)
+    fq = [json.loads(l) for l in open(c / "eval" / "factqa.jsonl")]
+    rs = [json.loads(l) for l in open(c / "eval" / "reason.jsonl")]
+    assert fq and rs
+    assert all(it["task"] == "factqa" and {"subj", "prop", "obj", "question",
+               "possible_answers", "split"} <= it.keys() for it in fq)
+    assert all(it["task"] == "reason" and it["answer"] in ("yes", "no")
+               and {"a", "va", "b", "vb", "prop"} <= it.keys() for it in rs)
 
 
-# ------------------------------------------------------------------ golden
-
-
-class _MockClient:
-    """Returns the gold object for each known question (offline stand-in)."""
-
-    def __init__(self, gold_by_question: dict[str, str]):
-        self.gold = gold_by_question
-        self.calls = 0
-
-    def answer(self, question: str) -> str:
-        self.calls += 1
-        return self.gold.get(question, "unknown")
-
-
-def test_generate_golden_knowledge_with_mock(tmp_path):
-    tok = get_tok()
-    build_poc_corpus(_micro_cfg(), tok, tmp_path / "corpus")
-    items = [QAItem(**json.loads(l))
-             for l in open(tmp_path / "corpus" / "eval" / "factqa.jsonl")]
-
-    # realfact eval items carry the question in the prompt, not meta.
-    from evals.gpt_oracle import _question_from_prompt
-    gold_by_q = {_question_from_prompt(it): it.meta["obj"] for it in items}
-
-    client = _MockClient(gold_by_q)
-    cache = tmp_path / "golden.jsonl"
-    gs = generate_golden_knowledge(items, client, cache)
-
-    assert gs.n == len(items)
-    assert set(gs.by_qid) == {it.qid for it in items}
-    assert gs.fidelity == pytest.approx(1.0)      # mock returns gold -> perfect
-    assert client.calls == len(items)             # one call per item
-    assert cache.exists()
-
-    # cached -> no new calls; round-trips through load_golden_knowledge
-    client2 = _MockClient(gold_by_q)
-    gs2 = generate_golden_knowledge(items, client2, cache)
-    assert client2.calls == 0
-    assert load_golden_knowledge(cache) == gs2.by_qid
-
-
-def test_reasoning_items_and_grade():
+def test_make_pairs():
     from corpusgen.realfact import load_realfacts
-    from evals import reasoning
-
-    facts = load_realfacts(REALFACTS)
-    items = reasoning.generate_reasoning_items(facts, n=12, seed=0, client=None)
-    assert 0 < len(items) <= 12
-    for it in items:
-        assert it["answer"] in ("yes", "no")
-        assert len(it["facts"]) == 2
-        same = it["facts"][0][2] == it["facts"][1][2]   # objA == objB
-        assert (it["answer"] == "yes") == same          # gold matches the facts
-        assert "Facts:" in reasoning.reasoning_prompt(it)
-        assert it["question"] in reasoning.reasoning_prompt(it)
-    assert reasoning.grade_yesno("I think the answer is yes.", "yes")
-    assert reasoning.grade_yesno("No, they differ.", "no")
-    assert not reasoning.grade_yesno("No, they differ.", "yes")
-    assert not reasoning.grade_yesno("maybe", "yes")
+    pairs = make_pairs(load_realfacts(REALFACTS), 20, seed=0)
+    assert 0 < len(pairs) <= 20
+    for prop, a, va, b, vb in pairs:
+        assert a != b and isinstance(prop, str)
 
 
-def test_judge_answer_mock():
-    from evals.gpt_oracle import judge_answer
+def test_prompts_and_grading():
+    fq = {"task": "factqa", "split": "seen", "subj": "Film A", "prop": "director",
+          "obj": "Xavier Dolan", "question": "Who directed Film A?",
+          "possible_answers": ["Xavier Dolan"]}
+    assert "Context: The director of Film A is Xavier Dolan." in context_eval.build_prompt(fq, True)
+    assert "Context:" not in context_eval.build_prompt(fq, False)
+    assert context_eval._grade(fq, "Reasoning...\nAnswer: Xavier Dolan", None)
+    assert not context_eval._grade(fq, "Answer: someone else", None)
+
+    rs = {"task": "reason", "split": "heldout", "prop": "country",
+          "a": "A", "va": "France", "b": "B", "vb": "France",
+          "question": "Do A and B have the same country?", "answer": "yes"}
+    p = context_eval.build_prompt(rs, True)
+    assert "The country of A is France." in p and "The country of B is France." in p
+    assert context_eval._grade(rs, "yes, both France", None)
+    assert not context_eval._grade(rs, "no", None)
+
+
+def test_judge_and_helpers():
+    assert clean_value('  "Xavier Dolan."\nextra ') == "Xavier Dolan"
+    assert answer_matches("xavier dolan", ["Xavier Dolan"])
 
     class _Judge:
         def chat(self, system, user, max_tokens=None):
-            # inspect only the candidate line: correct iff it says 'politician'
             cand = user.split("Candidate answer:")[1].split("\n")[0].lower()
-            return "YES" if "politician" in cand else "NO"
+            return "YES" if "dolan" in cand else "NO"
 
     j = _Judge()
-    assert judge_answer(j, "occupation of X?", "politician", "a politician")
-    assert not judge_answer(j, "occupation of X?", "politician", "author")
-    assert not judge_answer(j, "q", "ref", "")   # empty candidate short-circuits
+    assert judge_answer(j, "director?", "Xavier Dolan", "it was Dolan")
+    assert not judge_answer(j, "director?", "Xavier Dolan", "someone")
+    assert not judge_answer(j, "q", "ref", "")
 
 
-def test_helpers():
-    assert clean_value('  "Albert Brooks."\nextra ') == "Albert Brooks"
-    assert answer_matches("albert brooks", ["Albert Brooks", "Al Brooks"])
-    assert not answer_matches("", ["x"])
-    assert GPTOracle("Paris").lookup("anything at all") == "Paris"
-    assert GPTOracle(None).lookup("q") is None
-
-
-# ------------------------------------------------------------ injection
-
-
-class _ScriptedCfg:
-    ctx = 64
-
-
-class _ScriptedModel:
-    """Deterministically emits <|db_start|> x <|db_retrieve|> then stops, so a
-    lookup always fires — training-independent proof that the oracle value is
-    injected into the generated text."""
-
-    def __init__(self, tok):
-        self.tok = tok
-        self.cfg = _ScriptedCfg()
-        self.q = tok.encode("x")[0]
-
-    def forward_step(self, idx, cache):
-        import torch
-
-        last = int(idx[0, -1].item())
-        if last == self.tok.DB_START:
-            nxt = self.q
-        elif last == self.q:
-            nxt = self.tok.DB_RETRIEVE
-        elif last == self.tok.DB_END:
-            nxt = self.tok.EOT
-        else:
-            nxt = self.tok.DB_START
-        b, t = idx.shape
-        logits = torch.zeros(b, t, self.tok.VOCAB_SIZE, device=idx.device)
-        logits[:, -1, nxt] = 1.0
-        return logits, cache
-
-
-def test_oracle_injection_lands_in_output():
-    tok = get_tok()
-    model = _ScriptedModel(tok)
-    oracle = GPTOracle("Paris")
-    texts, stats = generate_batch_with_stats(
-        model, tok, ["Question: capital of France?\nReasoning:"],
-        max_new=32, organizer=oracle, device="cpu",
-    )
-    assert stats["n_hits"] == 1
-    assert "Paris" in texts[0]
-    # and the shared scorer counts it correct
-    row = keyguess.score_item(
-        {"subj": "France", "prop": "capital", "obj": "Paris",
-         "possible_answers": ["Paris"], "split": "heldout"},
-        "Question: capital of France?\nReasoning:", texts[0],
-    )
-    assert row["answer_ok"] is True
-
-
-# ------------------------------------------------------------ end-to-end
-
-
-def _tiny_trainer_cfg(corpus_dir: Path, arm: str, out_dir: Path) -> dict:
-    return {
-        "run_id": f"poc_test_{arm}",
-        "arm": arm,
-        "model": {"n_layer": 1, "n_head": 1, "d_model": 32, "ctx": 48,
-                  "vocab_size": 50304},
-        "train_bin": str(corpus_dir / arm / "train.bin"),
-        "train_mask": str(corpus_dir / arm / "train.mask.bin") if arm == "split" else None,
-        "micro_batch_size": 2,
-        "tokens_per_step": 96,
-        "max_steps": 2,
-        "lr": 1e-3,
-        "warmup_steps": 1,
-        "seed": 0,
-        "device": "cpu",
-        "out_dir": str(out_dir),
-        "log_every": 1,
-        "eval_every": 10,
-        "snap_frac": 1.0,
-        "ckpt_minutes": 999,
-    }
+def _tiny_cfg(corpus_dir: Path, arm: str, out_dir: Path) -> dict:
+    return {"run_id": f"t_{arm}", "arm": arm,
+            "model": {"n_layer": 1, "n_head": 1, "d_model": 32, "ctx": 64,
+                      "vocab_size": 50304},
+            "train_bin": str(corpus_dir / arm / "train.bin"),
+            "train_mask": str(corpus_dir / arm / "train.mask.bin") if arm == "split" else None,
+            "micro_batch_size": 2, "tokens_per_step": 96, "max_steps": 2, "lr": 1e-3,
+            "warmup_steps": 1, "seed": 0, "device": "cpu", "out_dir": str(out_dir),
+            "log_every": 1, "eval_every": 10, "snap_frac": 1.0, "ckpt_minutes": 999}
 
 
 def test_end_to_end_tiny(tmp_path):
@@ -251,31 +106,14 @@ def test_end_to_end_tiny(tmp_path):
     tok = get_tok()
     corpus = tmp_path / "corpus"
     build_poc_corpus(_micro_cfg(), tok, corpus)
-
-    trainer = Trainer(_tiny_trainer_cfg(corpus, "split", tmp_path / "run"))
+    trainer = Trainer(_tiny_cfg(corpus, "split", tmp_path / "run"))
     trainer.train_steps()
-    model = trainer.model.eval()
+    net = trainer.model.eval()
 
-    items = [QAItem(**json.loads(l))
-             for l in open(corpus / "eval" / "factqa.jsonl")]
-    golden = {it.qid: it.meta["obj"] for it in items}   # gold as stand-in oracle
-
-    split_res = score_items_oracle(model, tok, items, golden, "cpu", max_new=48)
-    dense_res = score_items_closed_book(model, tok, items, "cpu", max_new=48)
-    dense_rag = score_items_rag(model, tok, items, golden, "cpu", max_new=48)
-
-    for res in (split_res, dense_res, dense_rag):
-        agg = res["aggregates"]
-        assert "all" in agg and agg["all"]["n"] == len(items)
-        assert len(res["texts"]) == len(items)
-        assert 0.0 <= agg["all"]["answer"] <= 1.0
-
-    # reason-over-facts eval runs on the same tiny model
-    from corpusgen.realfact import load_realfacts
-    from evals.reasoning import generate_reasoning_items, score_reasoning
-
-    r_items = generate_reasoning_items(load_realfacts(REALFACTS), n=8, seed=0, client=None)
-    rres = score_reasoning(model, tok, r_items, "cpu", max_new=8)
-    assert rres["n"] == len(r_items)
-    assert 0.0 <= rres["acc"] <= 1.0
-    assert 0.5 <= rres["majority_baseline"] <= 1.0
+    items = ([json.loads(l) for l in open(corpus / "eval" / "factqa.jsonl")]
+             + [json.loads(l) for l in open(corpus / "eval" / "reason.jsonl")])
+    for ctx in (False, True):
+        out = context_eval.score(net, tok, items, "cpu", context=ctx, max_new=16)
+        for task in ("factqa", "reason"):
+            assert "all" in out[task] and out[task]["all"]["n"] > 0
+            assert 0.0 <= out[task]["all"]["acc"] <= 1.0

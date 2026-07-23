@@ -1,33 +1,35 @@
-"""PoC corpus builder: real-fact single-hop dose + knowledge-free reasoning.
+"""PoC corpus: facts in context, no DB retrieval. One toggle separates the arms.
 
-Assembles ONE shared corpus, rendered twice (the only difference between the
-two arms):
+Every fact appears in a ``Context:`` block in the training text. The two arms
+train on the SAME docs; the ONLY difference is the loss mask on the fact VALUE
+inside the context:
 
-- **realfact** (the fact dose): real PopQA/Wikidata triples rendered as
-  Question/Reasoning/Answer traces. DENSE inlines the value (loss ON); SPLIT
-  wraps it in an organizer lookup with the value loss-masked. Single-hop by
-  construction (one lookup per trace).
-- **igsm** + **deduction** (the reasoning, for the supporting composite):
-  knowledge-free, byte-identical across arms — no lookups, all loss ON.
-- **bed**: a small synthetic English bed so language ability isn't degenerate;
-  identical across arms.
+- DENSE: loss ON everywhere -> it is trained to predict the value, so it
+  memorizes ``(subject, relation) -> value`` into its weights.
+- SPLIT: loss OFF on the value token(s) in the context -> it is never trained to
+  produce them, so it does not memorize them; it must READ them from the context
+  to answer (the Answer line keeps loss ON, so it learns to copy/reason over the
+  context). Facts are offloaded to context, freeing weight capacity.
 
-Writes `{dense,split}/train.bin` (+ `train.mask.bin`), `organizer.jsonl`
-(gold store for the upper-bound comparison), and `eval/{factqa,igsm,
-deduction}.jsonl`. The headline factqa eval is a balanced seen/held-out sample
-(default 25 + 25 = 50). Everything is deterministic in the cfg + seeds.
+Two tasks, both open-book:
+- fact-QA (single-hop): "Context: The {rel} of {subj} is {val}. Question: ... Answer: {val}".
+- reason-over-facts (comparison): two facts in context, "Do A and B share the
+  same {rel}?" -> yes/no (answer != either fact, so it requires combining them).
+
+Held-out facts (never in training context) test generalization. No ``<|db_*|>``
+tokens, no organizer, no retrieval interface anywhere.
 """
 
 from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
-from corpusgen import deduction, igsm_lite, realfact
+from corpusgen import realfact
 from corpusgen.records import Doc, plain
 
 _BED_SUBJECTS = ["The workshop", "A quiet river", "The old library", "Every morning",
@@ -49,47 +51,105 @@ class PoCBuildCfg:
     split_seed: int = 0
     render_seed: int = 0
     shuffle_seed: int = 123
-    max_facts: int | None = None          # cap total facts (before split) for speed
-    n_exposures: int = 6
-    n_igsm_docs: int = 1500
-    n_deduction_docs: int = 1500
+    max_facts: int | None = None
+    n_exposures: int = 6            # fact-QA exposures (the memorization dose)
+    n_reason_train: int = 3000      # comparison training items
     n_bed_docs: int = 800
-    igsm_op: tuple[int, int] = (1, 3)
-    deduction_depth: tuple[int, int] = (1, 2)
-    n_eval_heldout: int = 25
-    n_eval_seen: int = 25
-    n_igsm_eval: int = 50
-    n_deduction_eval: int = 50
+    n_factqa_heldout: int = 25
+    n_factqa_seen: int = 25
+    n_reason_eval: int = 50
     bed_sentences: tuple[int, int] = (4, 8)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def _toy_bed_docs(n: int, seed: int, sent_range: tuple[int, int]) -> list[Doc]:
+# ------------------------------------------------------------ renderings
+
+def _factqa_segs(subj, prop, obj, question, mask_value: bool):
+    return [
+        (f"Context: The {prop} of {subj} is", False),
+        (f" {obj}", mask_value),                       # <- the only toggled span
+        (f".\nQuestion: {question}\nAnswer:", False),
+        (f" {obj}", False),                            # answer: loss ON (copy)
+    ]
+
+
+def _factqa_doc(subj, prop, obj, question) -> Doc:
+    return Doc(kind="factqa",
+               dense_segments=_factqa_segs(subj, prop, obj, question, False),
+               split_segments=_factqa_segs(subj, prop, obj, question, True),
+               meta={"subj": subj, "prop": prop})
+
+
+def _reason_segs(prop, a, va, b, vb, gold, mask_value: bool):
+    return [
+        (f"Context: The {prop} of {a} is", False),
+        (f" {va}", mask_value),
+        (f". The {prop} of {b} is", False),
+        (f" {vb}", mask_value),
+        (f".\nQuestion: Do {a} and {b} have the same {prop}?\nAnswer:", False),
+        (f" {gold}", False),
+    ]
+
+
+def _reason_doc(prop, a, va, b, vb, gold) -> Doc:
+    return Doc(kind="reason",
+               dense_segments=_reason_segs(prop, a, va, b, vb, gold, False),
+               split_segments=_reason_segs(prop, a, va, b, vb, gold, True),
+               meta={"prop": prop})
+
+
+def _toy_bed_docs(n, seed, sent_range) -> list[Doc]:
     rng = random.Random(f"{seed}:bed")
-    docs: list[Doc] = []
+    docs = []
     for _ in range(n):
-        sents = [
-            f"{rng.choice(_BED_SUBJECTS)} {rng.choice(_BED_VERBS)} "
-            f"{rng.choice(_BED_OBJECTS)}."
+        text = " ".join(
+            f"{rng.choice(_BED_SUBJECTS)} {rng.choice(_BED_VERBS)} {rng.choice(_BED_OBJECTS)}."
             for _ in range(rng.randint(*sent_range))
-        ]
-        text = " ".join(sents)
-        seg = [plain(text)]
-        docs.append(Doc(kind="bed", dense_segments=seg, split_segments=seg, meta={}))
+        )
+        docs.append(Doc(kind="bed", dense_segments=[plain(text)],
+                        split_segments=[plain(text)], meta={}))
     return docs
 
 
-def _encode_arm(tok, docs: list[Doc], arm: str) -> tuple[np.ndarray, np.ndarray]:
-    """Concatenate every doc's per-arm encoding into (ids, loss_mask) streams.
+# ------------------------------------------------------------ comparison pairs
 
-    Small PoC corpora fit in RAM, so we concatenate directly (cf. the streaming
-    _ArmWriter in corpusgen/build.py). The dense mask is all-ones (loss
-    everywhere); only the split arm's fact values are masked.
-    """
-    id_bufs: list[np.ndarray] = []
-    mask_bufs: list[np.ndarray] = []
+def make_pairs(facts, n, seed) -> list[tuple]:
+    """Balanced same/different entity pairs sharing a relation.
+    Each pair is (prop, subjA, objA, subjB, objB); gold = yes iff objA == objB."""
+    rng = random.Random(f"{seed}:pairs")
+    by_prop: dict[str, list[tuple[str, str]]] = {}
+    for f in facts:
+        by_prop.setdefault(f.prop, []).append((f.subj, f.obj))
+    matching, different = [], []
+    for prop, entries in by_prop.items():
+        by_obj: dict[str, list[str]] = {}
+        for s, o in entries:
+            subs = by_obj.setdefault(o, [])
+            if s not in subs:
+                subs.append(s)
+        for obj, subs in by_obj.items():
+            for k in range(min(3, len(subs) - 1)):
+                matching.append((prop, subs[k], obj, subs[k + 1], obj))
+        objs = list(by_obj)
+        if len(objs) >= 2:
+            for _ in range(min(80, len(objs) * 3)):
+                o1, o2 = rng.sample(objs, 2)
+                different.append((prop, rng.choice(by_obj[o1]), o1,
+                                  rng.choice(by_obj[o2]), o2))
+    rng.shuffle(matching)
+    rng.shuffle(different)
+    half = min(n // 2, len(matching))
+    pairs = matching[:half] + different[: n - half]
+    rng.shuffle(pairs)
+    return pairs[:n]
+
+
+# ------------------------------------------------------------ build
+
+def _encode_arm(tok, docs, arm) -> tuple[np.ndarray, np.ndarray]:
+    id_bufs, mask_bufs = [], []
     for doc in docs:
         segs = doc.dense_segments if arm == "dense" else doc.split_segments
         ids, mask = tok.encode_segments(segs, add_eot=True)
@@ -100,100 +160,78 @@ def _encode_arm(tok, docs: list[Doc], arm: str) -> tuple[np.ndarray, np.ndarray]
     return ids, mask
 
 
-def _write_jsonl(items, path: Path) -> None:
+def _write_jsonl(rows, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        for it in items:
-            f.write(json.dumps(asdict(it)) + "\n")
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
 
 
-def build_poc_corpus(cfg: PoCBuildCfg, tok, out_dir: str | Path) -> dict:
+def build_poc_corpus(cfg: PoCBuildCfg, tok, out_dir) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     facts = realfact.load_realfacts(cfg.realfacts_path)
     if cfg.max_facts is not None and cfg.max_facts < len(facts):
-        # deterministic subsample keeping per-relation coverage roughly intact
         facts = sorted(facts, key=lambda f: (f.prop, f.subj))
-        rng = random.Random(f"{cfg.split_seed}:cap")
-        facts = rng.sample(facts, cfg.max_facts)
+        facts = random.Random(f"{cfg.split_seed}:cap").sample(facts, cfg.max_facts)
     seen, heldout = realfact.split_by_relation(facts, cfg.frac, seed=cfg.split_seed)
+    by_subj_prop = {(f.subj, f.prop): f for f in facts}
 
-    # ---- docs (shared corpus, rendered per arm) ----
-    real_docs = realfact.render_realfact_docs(
-        seen, n_exposures=cfg.n_exposures, seed=cfg.render_seed,
-        substitution_frac=0.0, fresh_flood=0,
-    )
-    igsm_docs = igsm_lite.generate_igsm_docs(
-        cfg.n_igsm_docs, cfg.igsm_op[0], cfg.igsm_op[1], cfg.render_seed * 1000 + 11
-    )
-    ded_docs = deduction.generate_deduction_docs(
-        cfg.n_deduction_docs, cfg.deduction_depth[0], cfg.deduction_depth[1],
-        cfg.render_seed * 1000 + 22,
-    )
+    # ---- training docs (all open-book; split masks the context value) ----
+    factqa_docs = [
+        _factqa_doc(f.subj, f.prop, f.obj, f.question)
+        for _ in range(cfg.n_exposures) for f in seen
+    ]
+    train_pairs = make_pairs(seen, cfg.n_reason_train, cfg.render_seed)
+    reason_docs = [_reason_doc(p, a, va, b, vb, "yes" if va == vb else "no")
+                   for (p, a, va, b, vb) in train_pairs]
     bed_docs = _toy_bed_docs(cfg.n_bed_docs, cfg.render_seed, cfg.bed_sentences)
 
-    docs = list(real_docs) + list(igsm_docs) + list(ded_docs) + list(bed_docs)
+    docs = factqa_docs + reason_docs + bed_docs
     random.Random(cfg.shuffle_seed).shuffle(docs)
 
-    # ---- per-arm token streams ----
-    arm_reports: dict[str, dict] = {}
+    arm_reports = {}
     for arm in ("dense", "split"):
         ids, mask = _encode_arm(tok, docs, arm)
-        arm_dir = out_dir / arm
-        arm_dir.mkdir(parents=True, exist_ok=True)
-        ids.tofile(arm_dir / "train.bin")
-        mask.tofile(arm_dir / "train.mask.bin")
-        arm_reports[arm] = {
-            "n_tokens": int(ids.size),
-            "masked_tokens": int((mask == 0).sum()),
-            "masked_token_frac": float((mask == 0).mean()) if ids.size else 0.0,
-        }
-
-    # ---- gold store (upper-bound / dense-baseline comparison) ----
-    realfact.build_real_organizer(seen + heldout).save(out_dir / "organizer.jsonl")
+        (out_dir / arm).mkdir(parents=True, exist_ok=True)
+        ids.tofile(out_dir / arm / "train.bin")
+        mask.tofile(out_dir / arm / "train.mask.bin")
+        arm_reports[arm] = {"n_tokens": int(ids.size),
+                            "masked_token_frac": float((mask == 0).mean()) if ids.size else 0.0}
 
     # ---- eval sets ----
-    held_items = realfact.realfact_eval_items(heldout, "heldout")
-    seen_items = realfact.realfact_eval_items(seen, "seen")
-    rng_eval = random.Random(f"{cfg.split_seed}:eval")
-    held_pick = rng_eval.sample(held_items, min(cfg.n_eval_heldout, len(held_items)))
-    seen_pick = rng_eval.sample(seen_items, min(cfg.n_eval_seen, len(seen_items)))
-    factqa_eval = held_pick + seen_pick
-    rng_eval.shuffle(factqa_eval)
-    _write_jsonl(factqa_eval, out_dir / "eval" / "factqa.jsonl")
+    rng = random.Random(f"{cfg.split_seed}:eval")
 
-    igsm_hashes = {d.meta["structure_hash"] for d in igsm_docs}
-    ded_hashes = {d.meta["structure_hash"] for d in ded_docs}
-    igsm_eval = igsm_lite.generate_igsm_eval(
-        cfg.n_igsm_eval, cfg.igsm_op[0], cfg.igsm_op[1],
-        cfg.render_seed * 1000 + 44, igsm_hashes,
-    )
-    ded_eval = deduction.generate_deduction_eval(
-        cfg.n_deduction_eval, cfg.deduction_depth[0], cfg.deduction_depth[1],
-        cfg.render_seed * 1000 + 55, ded_hashes,
-    )
-    _write_jsonl(igsm_eval, out_dir / "eval" / "igsm.jsonl")
-    _write_jsonl(ded_eval, out_dir / "eval" / "deduction.jsonl")
+    def factqa_items(pool, label, k):
+        picks = rng.sample(pool, min(k, len(pool)))
+        return [{"qid": f"fq-{label}-{i}", "task": "factqa", "split": label,
+                 "subj": f.subj, "prop": f.prop, "obj": f.obj,
+                 "question": f.question, "possible_answers": list(f.possible_answers)}
+                for i, f in enumerate(picks)]
+
+    factqa_eval = (factqa_items(heldout, "heldout", cfg.n_factqa_heldout)
+                   + factqa_items(seen, "seen", cfg.n_factqa_seen))
+
+    reason_eval = []
+    for i, (p, a, va, b, vb) in enumerate(make_pairs(heldout, cfg.n_reason_eval,
+                                                      cfg.render_seed + 1)):
+        reason_eval.append({"qid": f"rs-heldout-{i}", "task": "reason",
+                            "split": "heldout", "prop": p,
+                            "a": a, "va": va, "b": b, "vb": vb,
+                            "question": f"Do {a} and {b} have the same {p}?",
+                            "answer": "yes" if va == vb else "no"})
+
+    _write_jsonl(factqa_eval, out_dir / "eval" / "factqa.jsonl")
+    _write_jsonl(reason_eval, out_dir / "eval" / "reason.jsonl")
 
     report = {
         "cfg": cfg.to_dict(),
-        "n_facts_total": len(facts),
-        "n_seen": len(seen),
-        "n_heldout": len(heldout),
-        "n_docs": len(docs),
-        "component_docs": {
-            "realfact": len(real_docs), "igsm": len(igsm_docs),
-            "deduction": len(ded_docs), "bed": len(bed_docs),
-        },
+        "n_seen": len(seen), "n_heldout": len(heldout),
+        "component_docs": {"factqa": len(factqa_docs), "reason": len(reason_docs),
+                           "bed": len(bed_docs)},
         "arms": arm_reports,
-        "eval_counts": {
-            "factqa": len(factqa_eval),
-            "factqa_heldout": len(held_pick),
-            "factqa_seen": len(seen_pick),
-            "igsm": len(igsm_eval),
-            "deduction": len(ded_eval),
-        },
+        "eval_counts": {"factqa": len(factqa_eval), "reason": len(reason_eval)},
     }
     with open(out_dir / "build_report.json", "w") as f:
         json.dump(report, f, indent=2)
