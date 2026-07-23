@@ -121,8 +121,17 @@ GPT disagrees, making the oracle exactly optimal), `--gpt-model`.
   reported both string-match and (with `--judge`) LLM-graded; the judge number
   is the fair one, since PopQA long-tail answers have many valid phrasings.
 - **Reason-over-facts:** dense vs split on compositional yes/no questions, with
-  the majority-class baseline shown. This is the arm that actually needs
-  *combining* facts (fact ≠ answer); single-hop fact-QA does not.
+  the majority-class baseline and an **`answered`** rate (did the model produce
+  a yes/no at all). This is the arm that actually needs *combining* facts
+  (fact ≠ answer); single-hop fact-QA does not.
+  - **Fairness caveat:** the split model was trained to *retrieve* facts, not to
+    *read* facts from a context block, so this eval is somewhat off-distribution
+    for it (more than for dense, whose training states facts inline). We suppress
+    the lookup tokens during this decode so split can't fall back to retrieval,
+    and report `answered` so a disengaged arm is visible — but a truly clean
+    split reasoning number would require training it to retrieve-then-reason
+    (multi-hop). The **knowledge-free composite** (iGSM+deduction) is the fairest
+    capacity comparison, since both arms trained on byte-identical traces there.
 
 Note on single-hop fact-QA: because the retrieved fact **is** the answer, the
 `SPLIT @ gold` arm is essentially a copy sanity-check (100%), and the fact-QA

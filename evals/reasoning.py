@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from evals.generate import generate_batch_with_stats
+from evals.oracle_scorer import guard_vocab
 
 
 def _by_prop(facts) -> dict[str, list[tuple[str, str]]]:
@@ -130,6 +131,10 @@ def reasoning_prompt(item: dict) -> str:
     return f"Facts:\n{facts}\nQuestion: {item['question']}\nAnswer:"
 
 
+def _has_yesno(pred: str) -> bool:
+    return bool(re.search(r"\b(yes|no)\b", pred.lower()))
+
+
 def grade_yesno(pred: str, gold: str) -> bool:
     """First standalone yes/no token in the generation must match gold."""
     m = re.search(r"\b(yes|no)\b", pred.lower())
@@ -137,10 +142,19 @@ def grade_yesno(pred: str, gold: str) -> bool:
 
 
 def score_reasoning(model, tok, items: list[dict], device,
-                    max_new: int = 16, batch_size: int = 16) -> dict:
+                    max_new: int = 16, batch_size: int = 16,
+                    suppress_db: bool = True) -> dict:
     """Decode each item RAG-style (facts in context, store OFF) and grade yes/no.
-    Also reports the majority-class baseline so a degenerate always-yes/always-no
-    model is obvious."""
+
+    suppress_db (default True) blocks the DB lookup tokens so the split model
+    can't fall back to retrieval and must answer from the in-context facts —
+    a no-op for the dense model. Reports:
+      - acc: fraction correct
+      - answered_rate: fraction that produced a yes/no at all (engagement; a low
+        value means the model isn't really doing the task, so acc ~ noise)
+      - majority_baseline: the always-pick-the-common-label score
+    """
+    model = guard_vocab(model, suppress_db=suppress_db)
     prompts = [reasoning_prompt(it) for it in items]
     texts: list[str] = []
     for lo in range(0, len(prompts), batch_size):
@@ -151,11 +165,13 @@ def score_reasoning(model, tok, items: list[dict], device,
         texts.extend(bt)
     rows = [
         {"qid": it["qid"], "gold": it["answer"], "pred": t[:80].strip(),
-         "correct": grade_yesno(t, it["answer"])}
+         "answered": _has_yesno(t), "correct": grade_yesno(t, it["answer"])}
         for it, t in zip(items, texts)
     ]
     n = len(rows)
     acc = sum(r["correct"] for r in rows) / n if n else 0.0
+    answered = sum(r["answered"] for r in rows) / n if n else 0.0
     n_yes = sum(1 for it in items if it["answer"] == "yes")
     majority = max(n_yes, n - n_yes) / n if n else 0.0
-    return {"acc": acc, "n": n, "majority_baseline": majority, "rows": rows}
+    return {"acc": acc, "answered_rate": answered, "n": n,
+            "majority_baseline": majority, "rows": rows}

@@ -354,16 +354,15 @@ def stage_reason(args) -> dict:
 
     block = {"n": len(items), "kind": "same_relation_yesno",
              "majority_baseline": dres["majority_baseline"],
-             "dense": dres["acc"], "split": sres["acc"]}
+             "dense": dres["acc"], "split": sres["acc"],
+             "dense_answered": dres["answered_rate"],
+             "split_answered": sres["answered_rate"]}
     results = json.load(open(RESULTS_PATH)) if RESULTS_PATH.exists() else {}
     results["reasoning_facts"] = block
     PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_PATH, "w") as f:
         json.dump(results, f, indent=2)
-    print("\n=== Reason-over-facts (in-context; combine 2 facts) ===")
-    print(f"(majority-class baseline: {block['majority_baseline']*100:.0f}%)")
-    print(f"{'dense':<10}{dres['acc']*100:11.1f}%")
-    print(f"{'split':<10}{sres['acc']*100:11.1f}%")
+    _print_table(results)
     return block
 
 
@@ -423,9 +422,11 @@ def _print_table(results: dict) -> None:
     rf = results.get("reasoning_facts")
     if rf:
         print("\n=== Reason-over-facts (in-context; combine 2 facts) ===")
-        print(f"(majority-class baseline {rf['majority_baseline']*100:.0f}%, n={rf['n']})")
-        print(f"{'dense':<10}{rf['dense']*100:11.1f}%")
-        print(f"{'split':<10}{rf['split']*100:11.1f}%")
+        print(f"(majority-class baseline {rf['majority_baseline']*100:.0f}%, n={rf['n']}; "
+              "answered = produced a yes/no)")
+        print(f"{'arm':<10}{'accuracy':>12}{'answered':>12}")
+        print(f"{'dense':<10}{rf['dense']*100:11.1f}%{rf.get('dense_answered',0)*100:11.0f}%")
+        print(f"{'split':<10}{rf['split']*100:11.1f}%{rf.get('split_answered',0)*100:11.0f}%")
 
 
 def stage_report(args) -> None:

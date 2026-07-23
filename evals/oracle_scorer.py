@@ -18,7 +18,7 @@ from __future__ import annotations
 from evals.generate import generate_batch_with_stats
 from evals.gpt_oracle import GPTOracle
 from evals.keyguess import score_items as keyguess_score_items
-from train.tokenizer import SPECIAL_TOKENS, VOCAB_SIZE
+from train.tokenizer import DB_SPECIAL_TOKENS, SPECIAL_TOKENS, VOCAB_SIZE
 
 # Vocab is padded to VOCAB_SIZE (50304) but only ids up to the last special
 # token are decodable; ids in (LAST_DECODABLE, VOCAB_SIZE) are pure padding
@@ -26,26 +26,36 @@ from train.tokenizer import SPECIAL_TOKENS, VOCAB_SIZE
 # crash tiktoken's decode. Masking their logits is strictly correct (they are
 # never valid outputs) and keeps generation robust at PoC scale.
 FIRST_PAD_ID = max(SPECIAL_TOKENS.values()) + 1
+_DB_IDS = (DB_SPECIAL_TOKENS["<|db_start|>"], DB_SPECIAL_TOKENS["<|db_retrieve|>"],
+           DB_SPECIAL_TOKENS["<|db_end|>"])
 
 
 class VocabMaskedModel:
-    """forward_step wrapper that -inf-masks non-decodable padding-id logits."""
+    """forward_step wrapper that -inf-masks non-decodable padding-id logits, and
+    (optionally) the DB lookup tokens — used to stop the split model from falling
+    back to retrieval in the in-context reasoning eval, so it must answer from
+    the provided facts (a no-op for the dense model, which never emits them)."""
 
-    def __init__(self, model, first_pad_id: int = FIRST_PAD_ID):
+    def __init__(self, model, first_pad_id: int = FIRST_PAD_ID,
+                 extra_ids: tuple[int, ...] = ()):
         self._model = model
         self.cfg = getattr(model, "cfg", None)
         self._first_pad = first_pad_id
+        self._extra = tuple(extra_ids)
 
     def forward_step(self, idx, cache):
         logits, cache = self._model.forward_step(idx, cache)
         if self._first_pad < VOCAB_SIZE:
             logits[..., self._first_pad:] = float("-inf")
+        for i in self._extra:
+            logits[..., i] = float("-inf")
         return logits, cache
 
 
-def guard_vocab(model):
-    """Wrap a model so eval generation can never emit an undecodable pad id."""
-    return VocabMaskedModel(model)
+def guard_vocab(model, suppress_db: bool = False):
+    """Wrap a model so eval generation can never emit an undecodable pad id.
+    With suppress_db=True, also block the DB lookup tokens."""
+    return VocabMaskedModel(model, extra_ids=_DB_IDS if suppress_db else ())
 
 
 def _merge_stats(acc: dict, batch: dict) -> None:
