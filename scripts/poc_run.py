@@ -123,6 +123,24 @@ def _load_model(run_dir: Path, device: str) -> GPT:
     return guard_vocab(model)
 
 
+def _trained_step(run_dir: Path) -> int:
+    """Last logged training step for a run (from log.jsonl), or -1 if none.
+    Cheap check (tiny log) so we can reuse a finished checkpoint without loading
+    the multi-GB ckpt."""
+    log = Path(run_dir) / "log.jsonl"
+    if not log.exists():
+        return -1
+    last = ""
+    with open(log) as f:
+        for line in f:
+            if line.strip():
+                last = line
+    try:
+        return int(json.loads(last).get("step", -1)) if last else -1
+    except (ValueError, json.JSONDecodeError):
+        return -1
+
+
 def _load_items(path: Path) -> list[QAItem]:
     with open(path) as f:
         return [QAItem(**json.loads(line)) for line in f if line.strip()]
@@ -167,6 +185,13 @@ def stage_train(args, arms=ARMS) -> None:
     print(f"[train] model={args.model} checkpoints -> {RUNS_DIR / args.model} "
           f"({'PERSISTED (Drive)' if os.environ.get('POC_PERSIST_DIR') else 'LOCAL/ephemeral'})")
     for arm in arms:
+        run_dir = _run_dir(args.model, arm)
+        done_step = _trained_step(run_dir)
+        # Reuse an already-trained checkpoint instead of retraining.
+        if (run_dir / "ckpt.pt").exists() and not args.fresh and done_step >= args.steps:
+            print(f"[train] {arm}: found trained checkpoint at step {done_step} "
+                  f"(>= {args.steps}); reusing it, skipping training (--fresh to retrain)")
+            continue
         cfg = _trainer_cfg(arm, args.steps, device, args.model,
                            ckpt_minutes=args.ckpt_minutes)
         trainer = Trainer(cfg)
