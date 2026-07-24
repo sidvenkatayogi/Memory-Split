@@ -56,9 +56,13 @@ class Chain:
 
 
 def sample_chain(g: Wikidata5M, funcs: set[str], depth: int,
-                 rng: random.Random, tries: int = 40) -> Chain | None:
-    """A path of `depth` functional hops where every hop resolves uniquely."""
-    subjects = list(g.adj)
+                 rng: random.Random, tries: int = 40,
+                 subjects: list[str] | None = None) -> Chain | None:
+    """A path of `depth` functional hops where every hop resolves uniquely.
+    Pass `subjects` (= list(g.adj)) to avoid rebuilding it every call — at
+    millions of entities that per-call list() is quadratic and hangs."""
+    if subjects is None:
+        subjects = list(g.adj)
     if not subjects:
         return None
     for _ in range(tries):
@@ -94,8 +98,10 @@ class Aggregation:
 
 
 def sample_aggregation(g: Wikidata5M, funcs: set[str], rng: random.Random,
-                       tries: int = 80, min_branch: int = 2) -> Aggregation | None:
-    subjects = list(g.adj)
+                       tries: int = 80, min_branch: int = 2,
+                       subjects: list[str] | None = None) -> Aggregation | None:
+    if subjects is None:
+        subjects = list(g.adj)
     for _ in range(tries):
         x = rng.choice(subjects)
         rels: dict[str, list[str]] = defaultdict(list)
@@ -203,14 +209,15 @@ def generate(g: Wikidata5M, n_train: int, n_eval: int, max_depth: int = 3,
     rng = random.Random(f"{seed}:mh")
     if funcs is None:
         funcs = g.functional_relations()
+    subjects = list(g.adj)          # hoisted once (see sample_chain docstring)
     train_docs: list[Doc] = []
     for _ in range(n_train):
         if rng.random() < agg_frac:
-            a = sample_aggregation(g, funcs, rng)
+            a = sample_aggregation(g, funcs, rng, subjects=subjects)
             if a is not None:
                 train_docs.append(agg_doc(g, a))
                 continue
-        ch = sample_chain(g, funcs, rng.randint(1, max_depth), rng)
+        ch = sample_chain(g, funcs, rng.randint(1, max_depth), rng, subjects=subjects)
         if ch is not None:
             train_docs.append(chain_doc(g, ch))
 
@@ -220,7 +227,7 @@ def generate(g: Wikidata5M, n_train: int, n_eval: int, max_depth: int = 3,
         if len(eval_items) >= n_eval:
             break
         if rng.random() < agg_frac:
-            a = sample_aggregation(g, funcs, rng)
+            a = sample_aggregation(g, funcs, rng, subjects=subjects)
             if a is None:
                 continue
             _, _, _, _, _, q = _agg_texts(g, a)
@@ -230,7 +237,7 @@ def generate(g: Wikidata5M, n_train: int, n_eval: int, max_depth: int = 3,
                 "context": _agg_context(g, a), "depth": 2,
             })
         else:
-            ch = sample_chain(g, funcs, rng.randint(1, max_depth), rng)
+            ch = sample_chain(g, funcs, rng.randint(1, max_depth), rng, subjects=subjects)
             if ch is None:
                 continue
             q, steps = _chain_texts(g, ch)
