@@ -170,7 +170,8 @@ class Trainer:
                                 capture_output=True, text=True, timeout=120)
             if ls.returncode == 0 and ls.stdout.strip():
                 subprocess.run(["aws", "s3", "cp", src, str(self.ckpt_path),
-                                "--region", self.s3_region], check=False, timeout=1200)
+                                "--region", self.s3_region, "--no-progress"],
+                               check=False, timeout=1200)
                 print(f"pulled resume ckpt from {src}")
         except Exception:
             pass
