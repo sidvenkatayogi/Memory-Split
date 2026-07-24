@@ -9,6 +9,7 @@ import contextlib
 import json
 import math
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -124,6 +125,8 @@ class Trainer:
         (self.out_dir / "snapshots").mkdir(exist_ok=True)
         self.ckpt_path = self.out_dir / "ckpt.pt"
         self.log_path = self.out_dir / "log.jsonl"
+        self.s3_ckpt = cfg.get("s3_ckpt")            # optional s3://.../<tag>_<arm> prefix
+        self.s3_region = cfg.get("s3_region", "us-east-1")
         self.snap_every = max(1, int(self.max_steps * cfg.get("snap_frac", 0.10)))
         self.ckpt_seconds = cfg.get("ckpt_minutes", 30) * 60
         self.log_every = cfg.get("log_every", 20)
@@ -143,6 +146,35 @@ class Trainer:
         m = self.model.module if self.ddp else self.model
         return getattr(m, "_orig_mod", m)
 
+    # --- S3 durability (optional; ephemeral-instance safe) -----------------
+
+    def _s3_push(self, local, name: str) -> None:
+        """Best-effort upload of `local` to <s3_ckpt>/<name>. Never raises."""
+        if not self.s3_ckpt:
+            return
+        dst = self.s3_ckpt.rstrip("/") + "/" + name
+        try:
+            subprocess.run(["aws", "s3", "cp", str(local), dst, "--region", self.s3_region],
+                           check=False, capture_output=True, timeout=1200)
+        except Exception:
+            pass
+
+    def maybe_pull_ckpt_from_s3(self) -> None:
+        """Rank-0: if no local ckpt but S3 has one, download it so training
+        resumes across a terminated/preempted instance. Call before load_ckpt."""
+        if not self.s3_ckpt or self.ckpt_path.exists():
+            return
+        src = self.s3_ckpt.rstrip("/") + "/ckpt.pt"
+        try:
+            ls = subprocess.run(["aws", "s3", "ls", src, "--region", self.s3_region],
+                                capture_output=True, text=True, timeout=120)
+            if ls.returncode == 0 and ls.stdout.strip():
+                subprocess.run(["aws", "s3", "cp", src, str(self.ckpt_path),
+                                "--region", self.s3_region], check=False, timeout=1200)
+                print(f"pulled resume ckpt from {src}")
+        except Exception:
+            pass
+
     def save_ckpt(self) -> None:
         raw = self._raw()
         state = {
@@ -157,6 +189,9 @@ class Trainer:
         tmp = self.ckpt_path.with_suffix(".tmp")
         torch.save(state, tmp)
         os.replace(tmp, self.ckpt_path)
+        if self.is_main:
+            self._s3_push(self.ckpt_path, "ckpt.pt")
+            self._s3_push(self.log_path, "log.jsonl")
 
     def load_ckpt(self, path: str | Path | None = None) -> None:
         state = torch.load(path or self.ckpt_path, map_location=self.device, weights_only=False)
@@ -171,10 +206,13 @@ class Trainer:
 
     def save_snapshot(self) -> None:
         raw = self._raw()
+        snap = self.out_dir / "snapshots" / f"step{self.step:07d}.pt"
         torch.save(
             {"model": raw.state_dict(), "step": self.step, "model_cfg": raw.cfg.__dict__},
-            self.out_dir / "snapshots" / f"step{self.step:07d}.pt",
+            snap,
         )
+        if self.is_main:
+            self._s3_push(snap, f"snapshots/step{self.step:07d}.pt")
 
     # --- metrics -----------------------------------------------------------
 

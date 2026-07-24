@@ -25,8 +25,8 @@ from train.tokenizer import get_tok
 
 
 def _config(model, condition, ctx, micro_bs, tokens_per_step, total_tokens,
-            lr, seed, train_bin, train_mask, out_dir, tag) -> dict:
-    return {
+            lr, seed, train_bin, train_mask, out_dir, tag, s3_ckpt=None) -> dict:
+    conf = {
         "schema_version": 1,
         "run_id": f"{tag}_{condition}_s{seed}",
         "model": model,
@@ -49,6 +49,10 @@ def _config(model, condition, ctx, micro_bs, tokens_per_step, total_tokens,
         "train_mask": str(train_mask),
         "out_dir": str(out_dir),
     }
+    if s3_ckpt:
+        conf["s3_ckpt"] = s3_ckpt          # ckpt/snapshots pushed here for durability
+        conf["s3_region"] = "us-east-1"
+    return conf
 
 
 def main() -> None:
@@ -71,6 +75,9 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--config-dir", default="configs/mh")
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--s3-ckpt-prefix", default=None,
+                    help="e.g. s3://memorysplit-sid-056956104102/runs ; per-arm "
+                         "ckpt+snapshots+log sync here so the run survives interruption")
     args = ap.parse_args()
 
     tag = args.tag or f"{args.model}_n{args.dose}"
@@ -91,10 +98,12 @@ def main() -> None:
     for arm in ("dense", "split"):
         n_tokens = rep["arms"][arm]["n_tokens"]
         total_tokens = n_tokens * args.exposures
+        s3ck = (args.s3_ckpt_prefix.rstrip("/") + f"/{tag}_{arm}"
+                if args.s3_ckpt_prefix else None)
         conf = _config(args.model, arm, args.ctx, args.micro_bs,
                        args.tokens_per_step, total_tokens, args.lr, args.seed,
                        out / arm / "train.bin", out / arm / "train.mask.bin",
-                       Path("runs") / f"{tag}_{arm}", tag)
+                       Path("runs") / f"{tag}_{arm}", tag, s3ck)
         path = cfg_dir / f"{tag}_{arm}.yaml"
         with open(path, "w") as f:
             yaml.safe_dump(conf, f, sort_keys=False)

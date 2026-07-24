@@ -1,4 +1,4 @@
-"""GPT-5.5 gateway client + LLM-as-judge, used only for *grading* fact-QA.
+"""Claude-Sonnet-5 gateway client + LLM-as-judge, used only for *grading* fact-QA.
 
 The PoC puts real facts directly in the model's context (no retrieval), so GPT
 is no longer a retriever. It is used only to grade free-form fact-QA answers
@@ -14,7 +14,7 @@ import time
 from organizer.store import normalize
 
 DEFAULT_BASE_URL = "https://tfy.promptlens.trilogy.com/v1"
-DEFAULT_MODEL = "openai-group/gpt-5.5"
+DEFAULT_MODEL = "claude-group/claude-sonnet-5"
 
 
 def default_model() -> str:
@@ -46,8 +46,11 @@ class GatewayClient:
     OPENAI_API_KEY / OPENAI_BASE_URL from the env)."""
 
     def __init__(self, model: str | None = None, base_url: str | None = None,
-                 api_key: str | None = None, max_tokens: int = 64,
-                 temperature: float = 0.0, max_retries: int = 4):
+                 api_key: str | None = None, max_tokens: int = 256,
+                 temperature: float | None = None, max_retries: int = 4):
+        # temperature is omitted from requests when None: claude-sonnet-5 rejects
+        # the param ("deprecated for this model"). max_tokens is large enough to
+        # cover any hidden reasoning tokens on reasoning-model backends.
         from openai import OpenAI
 
         self.model = model or default_model()
@@ -63,13 +66,15 @@ class GatewayClient:
         last_err: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                resp = self._client.chat.completions.create(
+                kwargs = dict(
                     model=self.model,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": user}],
-                    temperature=self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
                 )
+                if self.temperature is not None:
+                    kwargs["temperature"] = self.temperature
+                resp = self._client.chat.completions.create(**kwargs)
                 return resp.choices[0].message.content or ""
             except Exception as err:  # noqa: BLE001 - surface after retries
                 last_err = err
@@ -99,4 +104,4 @@ def judge_answer(client, question: str, reference: str, candidate: str) -> bool:
         return False
     user = (f"Question: {question}\nReference answer: {reference}\n"
             f"Candidate answer: {candidate}\nIs the candidate correct? YES or NO.")
-    return client.chat(_JUDGE_SYSTEM, user, max_tokens=4).strip().upper().startswith("Y")
+    return client.chat(_JUDGE_SYSTEM, user, max_tokens=64).strip().upper().startswith("Y")

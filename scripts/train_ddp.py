@@ -46,6 +46,14 @@ def main() -> None:
               f"= mbs {cfg['micro_batch_size']} x ctx {ctx} x ws {ws} x accum {accum}")
 
     trainer = Trainer(cfg)
+    # Resume: rank-0 pulls the last ckpt from S3 (if configured + none local),
+    # then a barrier so every rank loads the same shared file → identical weights.
+    if trainer.is_main:
+        trainer.maybe_pull_ckpt_from_s3()
+    if trainer.ddp:
+        import torch.distributed as dist
+
+        dist.barrier()
     if args.resume == "auto" and trainer.ckpt_path.exists():
         trainer.load_ckpt()
         if trainer.is_main:
