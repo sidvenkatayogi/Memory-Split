@@ -27,6 +27,7 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
+from itertools import zip_longest
 from pathlib import Path
 
 
@@ -42,6 +43,15 @@ class Wikidata5MPaths:
 
     def p(self, name: str) -> Path:
         return Path(self.root) / name
+
+    def resolve(self, *candidates: str) -> Path:
+        """First candidate relative path that exists under root; else the first.
+        Lets us tolerate the two Wikidata5M layouts (alias files under
+        wikidata5m_alias/ vs extracted flat at the root)."""
+        for c in candidates:
+            if c and (Path(self.root) / c).exists():
+                return Path(self.root) / c
+        return Path(self.root) / candidates[0]
 
 
 def _read_alias_file(path: Path) -> dict[str, list[str]]:
@@ -89,13 +99,18 @@ class Wikidata5M:
 
     @classmethod
     def load(cls, paths: Wikidata5MPaths, max_triples: int | None = None) -> "Wikidata5M":
-        entity_names = _read_alias_file(paths.p(paths.entity_alias))
-        rel_names = _read_alias_file(paths.p(paths.relation_alias))
+        entity_names = _read_alias_file(
+            paths.resolve(paths.entity_alias, "wikidata5m_entity.txt"))
+        rel_names = _read_alias_file(
+            paths.resolve(paths.relation_alias, "wikidata5m_relation.txt"))
         adj: dict[str, list[tuple[str, str]]] = defaultdict(list)
         n = 0
-        with open(paths.p(paths.triples), encoding="utf-8") as fh:
+        with open(paths.resolve(paths.triples, "wikidata5m_transductive.txt"),
+                  encoding="utf-8") as fh:
             for line in fh:
                 parts = line.rstrip("\n").split("\t")
+                if len(parts) != 3:
+                    parts = line.split()          # tolerate space-separated triples
                 if len(parts) != 3:
                     continue
                 h, r, t = parts
@@ -105,7 +120,7 @@ class Wikidata5M:
                     n += 1
                     if max_triples is not None and n >= max_triples:
                         break
-        heldout = _read_entities(paths.p(paths.inductive))
+        heldout = _read_entities(paths.resolve(paths.inductive))
         return cls(entity_names, rel_names, dict(adj), heldout)
 
     # -- accessors ----------------------------------------------------------
@@ -172,18 +187,12 @@ class Wikidata5M:
             by_rel[self.adj[s][0][0]].append(s)
         for lst in by_rel.values():
             rng.shuffle(lst)
-        # proportional allocation across relation buckets
-        picked: list[str] = []
-        rels = sorted(by_rel)
-        i = 0
-        while len(picked) < min(n_entities, len(subjects)):
-            bucket = by_rel[rels[i % len(rels)]]
-            if bucket:
-                picked.append(bucket.pop())
-            i += 1
-            if all(not by_rel[r] for r in rels):
-                break
-        picked_set = set(picked)
+        # round-robin interleave across relations (stratified), then take n.
+        # O(#subjects); avoids the O(#subjects * #relations) per-iteration scan
+        # that made this pathological at 20M-entity scale.
+        interleaved = [s for grp in zip_longest(*(by_rel[r] for r in sorted(by_rel)))
+                       for s in grp if s is not None]
+        picked_set = set(interleaved[:n_entities])
 
         sub_adj: dict[str, list[tuple[str, str]]] = {}
         objs_needed: set[str] = set()
