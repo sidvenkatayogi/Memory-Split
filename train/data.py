@@ -29,6 +29,8 @@ class PackedShards:
         start_cursor: int = 0,
         seed: int = 0,
         weights_path: str | Path | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.tokens = np.memmap(bin_path, dtype=np.uint16, mode="r")
         if mask_path is not None and Path(mask_path).exists():
@@ -46,11 +48,18 @@ class PackedShards:
         self.ctx = ctx
         self.batch_size = batch_size
         self.device = device
-        self.cursor = start_cursor
         self.n_tokens = len(self.tokens)
+        # DDP: partition the flat token stream into `world_size` disjoint
+        # contiguous shards so no two ranks ever train on the same tokens.
+        # The cursor is an offset WITHIN this rank's shard.
+        self.world_size = max(1, world_size)
+        self.rank = rank
+        self.region = self.n_tokens // self.world_size
+        self.region_start = self.rank * self.region
+        self.cursor = start_cursor
         self.epoch = 0
         span = self.batch_size * (self.ctx + 1)
-        assert self.n_tokens > span, "corpus smaller than one batch"
+        assert self.region > span, "per-rank shard smaller than one batch"
 
     def _window(self, start: int, length: int) -> tuple[np.ndarray, np.ndarray | None]:
         toks = np.asarray(self.tokens[start : start + length])
@@ -59,10 +68,10 @@ class PackedShards:
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         span = self.batch_size * (self.ctx + 1)
-        if self.cursor + span >= self.n_tokens:
+        if self.cursor + span >= self.region:
             self.cursor = 0
             self.epoch += 1
-        toks, msk = self._window(self.cursor, span)
+        toks, msk = self._window(self.region_start + self.cursor, span)
         self.cursor += self.batch_size * self.ctx  # overlap of 1 keeps every target trained
         toks = toks.astype(np.int64).reshape(self.batch_size, self.ctx + 1)
         x = torch.from_numpy(toks[:, :-1].copy())
@@ -81,7 +90,7 @@ class PackedShards:
     def _aligned_next_token_weights_for_last_batch(self) -> torch.Tensor:
         assert self.target_weights is not None
         span = self.batch_size * (self.ctx + 1)
-        start = self.cursor - self.batch_size * self.ctx
+        start = self.region_start + self.cursor - self.batch_size * self.ctx
         raw = np.asarray(self.target_weights[start : start + span])
         raw = raw.reshape(self.batch_size, self.ctx + 1)[:, 1:]
         weights = torch.from_numpy(raw.astype(np.float32, copy=True))

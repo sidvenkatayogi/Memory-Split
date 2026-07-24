@@ -5,6 +5,7 @@ and optional legacy-mask `loss_masked_values` logging.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -39,9 +40,28 @@ def cosine_lr(step: int, peak: float, warmup: int, total: int, min_frac: float =
 class Trainer:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.device = pick_device(cfg.get("device", "auto"))
-        torch.manual_seed(cfg["seed"])
-        if self.device == "cuda":
+        # --- DDP setup (torchrun sets these; single-process otherwise) ---
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.ddp = self.world_size > 1
+        if self.ddp:
+            import torch.distributed as dist
+
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.local_rank)
+                self.device = f"cuda:{self.local_rank}"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = pick_device(cfg.get("device", "auto"))
+        self.is_main = self.rank == 0
+        self._is_cuda = self.device.startswith("cuda")
+
+        torch.manual_seed(cfg["seed"] + self.rank)  # decorrelate per-rank dropout
+        if self._is_cuda:
             torch.cuda.manual_seed_all(cfg["seed"])
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -54,11 +74,21 @@ class Trainer:
         if "ctx" in cfg:
             model_cfg.ctx = cfg["ctx"]
         self.model = GPT(model_cfg).to(self.device)
-        if cfg.get("compile", False) and self.device == "cuda":
+        if cfg.get("compile", False) and self._is_cuda:
             self.model = torch.compile(self.model)
+        if self.ddp:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank] if self._is_cuda else None,
+            )
 
         self.micro_bs = cfg["micro_batch_size"]
-        self.accum = max(1, cfg["tokens_per_step"] // (self.micro_bs * model_cfg.ctx))
+        # tokens_per_step is the GLOBAL batch; split across ranks x accum.
+        self.accum = max(
+            1, cfg["tokens_per_step"] // (self.micro_bs * model_cfg.ctx * self.world_size)
+        )
         self.data = PackedShards(
             cfg["train_bin"],
             cfg.get("train_mask"),
@@ -67,6 +97,8 @@ class Trainer:
             device=self.device,
             seed=cfg["seed"],
             weights_path=cfg.get("train_weights"),
+            rank=self.rank,
+            world_size=self.world_size,
         )
         self.max_steps = cfg.get("max_steps") or int(
             cfg["total_tokens"] // cfg["tokens_per_step"]
@@ -83,7 +115,7 @@ class Trainer:
             lr=cfg["lr"],
             betas=(0.9, 0.95),
             eps=1e-8,
-            fused=self.device == "cuda",
+            fused=self._is_cuda,
         )
 
         self.step = 0
@@ -98,22 +130,28 @@ class Trainer:
         self.eval_every = cfg.get("eval_every", 250)
         self._probe = None  # lazy masked-value probe batches
 
-        with open(self.out_dir / "config.yaml", "w") as f:
-            import yaml
+        if self.is_main:
+            with open(self.out_dir / "config.yaml", "w") as f:
+                import yaml
 
-            yaml.safe_dump(cfg, f, sort_keys=False)
+                yaml.safe_dump(cfg, f, sort_keys=False)
 
     # --- checkpointing -----------------------------------------------------
 
+    def _raw(self):
+        """The underlying GPT, unwrapping DDP and torch.compile."""
+        m = self.model.module if self.ddp else self.model
+        return getattr(m, "_orig_mod", m)
+
     def save_ckpt(self) -> None:
-        raw = getattr(self.model, "_orig_mod", self.model)
+        raw = self._raw()
         state = {
             "model": raw.state_dict(),
             "opt": self.opt.state_dict(),
             "data": self.data.state_dict(),
             "step": self.step,
             "rng_torch": torch.get_rng_state(),
-            "rng_cuda": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
+            "rng_cuda": torch.cuda.get_rng_state_all() if self._is_cuda else None,
             "cfg": self.cfg,
         }
         tmp = self.ckpt_path.with_suffix(".tmp")
@@ -122,17 +160,17 @@ class Trainer:
 
     def load_ckpt(self, path: str | Path | None = None) -> None:
         state = torch.load(path or self.ckpt_path, map_location=self.device, weights_only=False)
-        raw = getattr(self.model, "_orig_mod", self.model)
+        raw = self._raw()
         raw.load_state_dict(state["model"])
         self.opt.load_state_dict(state["opt"])
         self.data.load_state_dict(state["data"])
         self.step = state["step"]
         torch.set_rng_state(state["rng_torch"].cpu())
-        if self.device == "cuda" and state.get("rng_cuda") is not None:
+        if self._is_cuda and state.get("rng_cuda") is not None:
             torch.cuda.set_rng_state_all(state["rng_cuda"])
 
     def save_snapshot(self) -> None:
-        raw = getattr(self.model, "_orig_mod", self.model)
+        raw = self._raw()
         torch.save(
             {"model": raw.state_dict(), "step": self.step, "model_cfg": raw.cfg.__dict__},
             self.out_dir / "snapshots" / f"step{self.step:07d}.pt",
@@ -167,10 +205,8 @@ class Trainer:
         return sum(losses) / len(losses) if losses else None
 
     def _autocast(self):
-        if self.device == "cuda":
+        if self._is_cuda:
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        import contextlib
-
         return contextlib.nullcontext()
 
     # --- loop ----------------------------------------------------------------
@@ -191,16 +227,21 @@ class Trainer:
                 group["lr"] = lr
             self.opt.zero_grad(set_to_none=True)
             micro_losses = []
-            for _ in range(self.accum):
-                if self.cfg.get("train_weights"):
-                    x, y, weights = self.data.next_weighted_batch()
-                    with self._autocast():
-                        _, loss = self.model(x, y, target_weights=weights)
-                else:
-                    x, y = self.data.next_batch()
-                    with self._autocast():
-                        _, loss = self.model(x, y)
-                (loss / self.accum).backward()
+            for micro in range(self.accum):
+                # DDP: only all-reduce grads on the final micro-step
+                last = micro == self.accum - 1
+                sync = (self.model.no_sync() if (self.ddp and not last)
+                        else contextlib.nullcontext())
+                with sync:
+                    if self.cfg.get("train_weights"):
+                        x, y, weights = self.data.next_weighted_batch()
+                        with self._autocast():
+                            _, loss = self.model(x, y, target_weights=weights)
+                    else:
+                        x, y = self.data.next_batch()
+                        with self._autocast():
+                            _, loss = self.model(x, y)
+                    (loss / self.accum).backward()
                 micro_losses.append(loss.item())
                 tokens_seen += x.numel()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -209,13 +250,14 @@ class Trainer:
             step_loss = sum(micro_losses) / len(micro_losses)
             running = step_loss if running is None else 0.95 * running + 0.05 * step_loss
 
-            if self.step % self.log_every == 0 or self.step == target:
+            if self.is_main and (self.step % self.log_every == 0 or self.step == target):
+                dt = max(1e-9, time.time() - t0)
                 row = {
                     "step": self.step,
                     "loss": round(step_loss, 4),
                     "loss_ema": round(running, 4),
                     "lr": lr,
-                    "tok_s": round(tokens_seen / max(1e-9, time.time() - t0), 1),
+                    "tok_s": round(tokens_seen * self.world_size / dt, 1),  # global
                     "epoch": self.data.epoch,
                 }
                 if self.step % self.eval_every == 0 or self.step == target:
@@ -226,12 +268,17 @@ class Trainer:
                     f.write(json.dumps(row) + "\n")
                 t0 = time.time()
                 tokens_seen = 0
-            if self.step % self.snap_every == 0:
+            if self.is_main and self.step % self.snap_every == 0:
                 self.save_snapshot()
-            if time.time() - last_ckpt > self.ckpt_seconds:
+            if self.is_main and time.time() - last_ckpt > self.ckpt_seconds:
                 self.save_ckpt()
                 last_ckpt = time.time()
-        self.save_ckpt()
+        if self.is_main:
+            self.save_ckpt()
+        if self.ddp:
+            import torch.distributed as dist
+
+            dist.barrier()
         return running if running is not None else float("nan")
 
 

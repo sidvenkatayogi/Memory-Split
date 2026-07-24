@@ -1,4 +1,4 @@
-"""GPT-5.6-sol gateway client + LLM-as-judge, used only for *grading* fact-QA.
+"""GPT-5.5 gateway client + LLM-as-judge, used only for *grading* fact-QA.
 
 The PoC puts real facts directly in the model's context (no retrieval), so GPT
 is no longer a retriever. It is used only to grade free-form fact-QA answers
@@ -14,7 +14,7 @@ import time
 from organizer.store import normalize
 
 DEFAULT_BASE_URL = "https://tfy.promptlens.trilogy.com/v1"
-DEFAULT_MODEL = "openai-group/gpt-5.6-sol"
+DEFAULT_MODEL = "openai-group/gpt-5.5"
 
 
 def default_model() -> str:
