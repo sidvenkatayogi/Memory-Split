@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from evals.generate import generate_batch_with_stats
-
 _ANSWER_TAG = "Answer:"
 _EOT_MARKER = "<|eot|>"
 
@@ -49,6 +47,8 @@ def score_items(
     {qid, task, correct, pred, answer, meta} plus the lookup stats
     aggregated over all batches.
     """
+    from evals.generate import generate_batch_with_stats
+
     rows: list[dict] = []
     total = {"n_lookups": 0, "n_hits": 0, "n_misses": 0, "n_malformed": 0}
     for lo in range(0, len(items), batch_size):

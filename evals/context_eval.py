@@ -16,27 +16,26 @@ from __future__ import annotations
 
 import re
 
-from evals.generate import generate_batch_with_stats
 from evals.gpt_oracle import answer_matches, judge_answer
 from evals.scorers import parse_answer
-from train.tokenizer import SPECIAL_TOKENS, VOCAB_SIZE
-
-# Vocab is padded to VOCAB_SIZE but ids above the last special token are pure
-# padding with untrained embeddings; an undertrained model can argmax onto them
-# and crash tiktoken's decode. Mask those logits during generation (they are
-# never valid outputs) so eval is robust at PoC scale.
-_FIRST_PAD_ID = max(SPECIAL_TOKENS.values()) + 1
 
 
 class _VocabGuard:
-    def __init__(self, model):
+    """Mask padding logits (ids above the last special token) during generation;
+    they are never valid outputs and an undertrained model can argmax onto them
+    and crash tiktoken's decode. first_pad_id/vocab_size are passed in so this
+    module imports without torch/tiktoken (keeps build_prompt/_grade testable)."""
+
+    def __init__(self, model, first_pad_id: int, vocab_size: int):
         self._model = model
+        self._first_pad = first_pad_id
+        self._vocab = vocab_size
         self.cfg = getattr(model, "cfg", None)
 
     def forward_step(self, idx, cache):
         logits, cache = self._model.forward_step(idx, cache)
-        if _FIRST_PAD_ID < VOCAB_SIZE:
-            logits[..., _FIRST_PAD_ID:] = float("-inf")
+        if self._first_pad < self._vocab:
+            logits[..., self._first_pad:] = float("-inf")
         return logits, cache
 
 
@@ -54,6 +53,12 @@ def build_prompt(item: dict, context: bool) -> str:
                     f"The {item['prop']} of {item['b']} is {item['vb']}.\n"
                     f"Question: {q}\nAnswer:")
         return f"Question: {q}\nAnswer:"
+    if task in ("mh_chain", "mh_agg"):
+        # multi-hop: gold atomic facts (the "optimal retriever") in the Context
+        # block; end at Reasoning: to elicit the CoT trace + final answer.
+        if context:
+            return f"Context: {item['context']}\nQuestion: {q}\nReasoning:"
+        return f"Question: {q}\nReasoning:"
     # puremath: context = the operation's definition (the "relevant fact")
     if context:
         return f"Context: {item['definition']}\nQuestion: {q}\nAnswer:"
@@ -61,23 +66,29 @@ def build_prompt(item: dict, context: bool) -> str:
 
 
 def _grade(item: dict, text: str, client) -> bool:
-    if item["task"] == "reason":
+    task = item["task"]
+    if task == "reason":
         m = re.search(r"\b(yes|no)\b", text.lower())
         return bool(m) and m.group(1) == item["answer"]
-    if item["task"] == "puremath":
+    if task in ("puremath", "mh_agg"):          # numeric answers (compute / count)
         m = re.search(r"-?\d+", parse_answer(text) or text)
         return bool(m) and m.group() == str(item["answer"])
+    # entity answers: factqa (gold = obj), mh_chain (gold = answer)
+    gold = item["obj"] if task == "factqa" else item["answer"]
     pred = parse_answer(text) or text
     if client is not None:
-        return judge_answer(client, item["question"], item["obj"], pred)
-    return answer_matches(pred, item.get("possible_answers") or [item["obj"]])
+        return judge_answer(client, item["question"], gold, pred)
+    return answer_matches(pred, item.get("possible_answers") or [gold])
 
 
 def score(model, tok, items: list[dict], device, context: bool,
           client=None, max_new: int = 48, batch_size: int = 16) -> dict:
     """Generate + grade all items under one condition. Returns
     {task: {split: {"acc", "n"}}} aggregated over splits + "all"."""
-    model = _VocabGuard(model)
+    from evals.generate import generate_batch_with_stats
+    from train.tokenizer import SPECIAL_TOKENS, VOCAB_SIZE
+
+    model = _VocabGuard(model, max(SPECIAL_TOKENS.values()) + 1, VOCAB_SIZE)
     prompts = [build_prompt(it, context) for it in items]
     texts: list[str] = []
     for lo in range(0, len(prompts), batch_size):
